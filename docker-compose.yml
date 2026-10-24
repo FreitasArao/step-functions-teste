@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: step-function-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: saga_user
+      POSTGRES_PASSWORD: saga_password
+      POSTGRES_DB: order_saga_db
+    volumes:
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saga_user -d order_saga_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  ministack:
+    image: ministack/ministack:latest
+    container_name: step-function-ministack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sfn,sqs,iam,sts
+      - AWS_DEFAULT_REGION=us-east-1
+      - DEBUG=1
+    restart: unless-stopped
