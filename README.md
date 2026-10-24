@@ -1,71 +1,112 @@
 # Order Saga — AWS Step Functions + SQS (`waitForTaskToken`) + Outbox/Inbox + DDD + Result Pattern + `dd-trace`
 
-Laboratório prático (**build to learn**) demonstrando como orquestrar uma **Saga com Rollback em Cascata (2 níveis)** no **AWS Step Functions** (via **MiniStack** e **Terraform**) mantendo a lógica de negócio 100% desacoplada da AWS através de:
+Laboratório prático (**build to learn**) demonstrando como orquestrar uma **Saga com Rollback em Cascata (2 níveis)** no **AWS Step Functions** (via **MiniStack**, **PostgreSQL 16** e **Terraform**) mantendo a lógica de negócio **100% agnóstica da AWS** através de:
 
 - **DDD & Monolito Modular** (`Order`, `Stock`, `Payment`, `Shipping`) com **Ports & Adapters**
+- **Camada de Tradução / Anti-Corruption Layer AWS (`AwsStepFunctionsTranslator`)** isolando `taskToken`, `executionArn` e formato de erro ASL fora do domínio
 - **Result Pattern (`Result<T, E>`)** em todo o domínio e casos de uso (**zero exceptions** para regras de negócio)
 - **AWS SQS (`sendMessage.waitForTaskToken`)** para execução assíncrona dos steps
-- **Transactional Outbox & Transactional Inbox** em todo o fluxo (garantia de entrega + idempotência contra entregas duplicadas do SQS)
+- **Transactional Outbox & Transactional Inbox** no PostgreSQL 16 (garantia de entrega + idempotência contra entregas duplicadas do SQS)
 - **`MessageWrapper<T>` + Datadog `dd-trace`** para propagação de **Trace Distribuído** (`x-datadog-trace-id`, `x-datadog-parent-id`, `traceparent`) através de banco (Outbox/Inbox), Step Functions e SQS
 
 ---
 
-## 1. Topologia da Saga e Rollback em Cascata
+## Como o Fluxo Funciona ao Bater em `POST /orders`?
+
+**Sim!** Uma vez com o ambiente de pé (na branch `master`, ou após você completar os `TODO`s na branch `practice/saga`), **basta fazer um `POST /orders`** e todo o ciclo abaixo acontece automaticamente em background:
 
 ```text
-[POST /orders]
-   │ (UnitOfWork: salva Order PENDING + Outbox START_ORDER_SAGA com MessageWrapper)
-   ▼
-[Step 1: RESERVE_STOCK] ──(Erro: INSUFFICIENT_STOCK)──────────────────────────────┐
-   │ (Ok)                                                                         │
-   ▼                                                                              │
-[Step 2: PROCESS_PAYMENT] ──(Erro: PAYMENT_DECLINED)──► [RELEASE_STOCK] ──────────┤
-   │ (Ok)                                                      ▲                  │
-   ▼                                                           │                  ▼
-[Step 3: CREATE_SHIPMENT] ──(Erro: SHIPPING_UNAVAILABLE)► [REFUND_PAYMENT]   [CANCEL_ORDER]
-   │ (Ok)                                                                         │
-   ▼                                                                              ▼
-[Step 4: CONFIRM_ORDER] ──► (OrderConfirmed: SUCCEEDED)                (OrderCancelled: FAILED)
+1. [HTTP POST /orders]
+     │
+     ▼
+2. [CreateOrderUseCase + PostgresUnitOfWork]
+     ├── Salva Order (status = 'PENDING') na tabela `orders`
+     └── Salva evento 'ORDER_WORKFLOW_REQUESTED' (status = 'PENDING') na tabela `outbox_messages`
+     │
+     ▼ (Polling automático a cada 250ms pelo OutboxRelayWorker -> RelayOutboxUseCase)
+3. [StepFunctionsOrderWorkflowAdapter + AwsStepFunctionsTranslator]
+     ├── Traduz MessageWrapper para StartExecutionCommand do AWS Step Functions
+     ├── Inicia a State Machine no MiniStack (usando orderId como nome da execução)
+     └── Marca o registro da Outbox como 'PUBLISHED'
+     │
+     ▼
+4. [MiniStack Step Functions -> MiniStack SQS]
+     ├── A State Machine entra no passo 1 ('ReserveStock')
+     ├── Publica mensagem JSON na fila SQS `order-saga-tasks-queue` com `$$.Task.Token`
+     └── Pausa a execução esperando callback (.waitForTaskToken)
+     │
+     ▼ (Polling automático a cada 300ms pelo SqsSagaStepWorker)
+5. [AwsStepFunctionsTranslator -> ExecuteSagaStepUseCase]
+     ├── Traduz o JSON da AWS (taskToken) para `WorkflowStepCommand` agnóstico (correlationToken)
+     ├── Abre transação ACID no Postgres (`PostgresUnitOfWork`):
+     │     1. Verifica idempotência na tabela `inbox_messages` (`orderId:stepName`)
+     │     2. Executa o Use Case de Domínio puro (`Result<T, DomainError>`)
+     │     3. Salva na `inbox_messages` (`outcome = 'OK'` ou `'ERR'`)
+     │     4. Salva na `outbox_messages` (`WORKFLOW_STEP_COMPLETED` ou `WORKFLOW_STEP_FAILED`)
+     └── Deleta a mensagem da fila SQS
+     │
+     ▼ (Polling automático pelo OutboxRelayWorker)
+6. [Callback para o Step Functions]
+     ├── Se 'WORKFLOW_STEP_COMPLETED' -> envia `SendTaskSuccessCommand` -> avança para o próximo Step!
+     └── Se 'WORKFLOW_STEP_FAILED'    -> envia `SendTaskFailureCommand` -> aciona o `Catch` (Rollback em Cascata)!
 ```
 
-### Regras de Domínio Determinísticas (para acionar cada cenário via payload)
-- **Estoque (`StockItem`):** `SKU-100` inicia com **10 unidades disponíveis**. Se `quantity > 10`, retorna `Result.err(InsufficientStockError)` (`code: "INSUFFICIENT_STOCK"`).
-- **Pagamento (`Payment`):** Limite máximo aprovado é **`1000`**. Se `amount > 1000`, retorna `Result.err(PaymentDeclinedError)` (`code: "PAYMENT_DECLINED"`).
-- **Envio (`Shipment`):** CEPs iniciados com **`"99"`** (ex: `"99000-000"`) não possuem cobertura de entrega e retornam `Result.err(ShippingUnavailableError)` (`code: "SHIPPING_UNAVAILABLE"`).
+> **Atenção sobre as Branches:**
+> - **Branch `master`:** Possui toda a implementação pronta e funcionando ponta a ponta.
+> - **Branch `practice/saga`:** Possui o Banco de Dados (Postgres), Entidades de Domínio, Repositórios e Use Cases de Domínio prontos, deixando os **6 arquivos da Saga/AWS com `TODO (Prática)`** para você implementar!
 
 ---
 
-## 2. Subindo o Ambiente Passo a Passo
+## 1. Passo a Passo: Como Rodar Tudo com MiniStack + PostgreSQL + Terraform
 
-### Passo 2.1 — Instalar dependências e rodar os testes automatizados
+### Passo 1.1 — Subir o PostgreSQL 16 e o MiniStack via Docker Compose
+Na raiz do projeto, execute:
 ```bash
-bun install
-bun run test
+docker compose up -d
+```
+Verifique se os 2 containers estão rodando (`step-function-postgres` na porta `5432` e `step-function-ministack` na porta `4566`):
+```bash
+docker compose ps
 ```
 
-### Passo 2.2 — Subir o PostgreSQL 16 + MiniStack (Docker) e provisionar Step Functions + SQS com Terraform
+### Passo 1.2 — Criar a Fila SQS e a State Machine no MiniStack via Terraform
 ```bash
-# 1. Subir os containers do PostgreSQL (porta 5432) e do MiniStack (porta 4566)
-docker compose up -d
-
-# 2. Provisionar a fila SQS, DLQ, IAM Role e State Machine no MiniStack
 cd infra
 terraform init
 terraform apply -auto-approve
 cd ..
 ```
+Ao finalizar, o Terraform exibirá os outputs:
+- `sqs_queue_url` (`http://localhost:4566/000000000000/order-saga-tasks-queue`)
+- `state_machine_arn` (`arn:aws:states:us-east-1:000000000000:stateMachine:order-saga-state-machine`)
 
-> **Nota:** O container `step-function-postgres` já executa automaticamente o script [`infra/postgres/init.sql`](./infra/postgres/init.sql) criando as 7 tabelas (`orders`, `stock_items`, `stock_reservations`, `payments`, `shipments`, `inbox_messages`, `outbox_messages`) e populando o estoque inicial (`SKU-100` com 10 unidades). Caso você rode sem o Docker, a aplicação faz fallback transparente para memória e para a engine ASL local (`AslLocalEngineService`).
-
-### Passo 2.3 — Iniciar a aplicação NestJS
+### Passo 1.3 — Iniciar a Aplicação NestJS
 ```bash
 bun run start:dev
 ```
-A API estará disponível em `http://localhost:3000`.
+A aplicação subirá em `http://localhost:3000`, conectará automaticamente ao PostgreSQL (`order_saga_db`) e iniciará os workers de background (`OutboxRelayWorker` e `SqsSagaStepWorker`).
 
 ---
 
-## 3. Como Testar Cada Etapa e os Rollbacks
+## 2. Roteiro de Implementação na Branch `practice/saga`
+
+Se você estiver na branch `practice/saga`, implemente os `TODO`s nesta sequência:
+
+1. [`src/modules/order/application/create-order.use-case.ts`](./src/modules/order/application/create-order.use-case.ts): Criar o `MessageWrapper` e salvar o evento `'ORDER_WORKFLOW_REQUESTED'` na Outbox dentro da `unitOfWork`.
+2. [`src/modules/order/application/execute-saga-step.use-case.ts`](./src/modules/order/application/execute-saga-step.use-case.ts): Implementar a coordenação agnóstica `Inbox` ➔ `UseCase de Domínio` ➔ `Outbox ('WORKFLOW_STEP_COMPLETED' | 'WORKFLOW_STEP_FAILED')`.
+3. [`src/modules/order/application/relay-outbox.use-case.ts`](./src/modules/order/application/relay-outbox.use-case.ts): Ler mensagens `PENDING` da Outbox e chamar `this._orderWorkflow` (`startOrderWorkflow`, `completeWorkflowStep`, `failWorkflowStep`).
+4. [`src/infra/aws/translators/sfn-acl.translator.ts`](./src/infra/aws/translators/sfn-acl.translator.ts): Implementar a camada de tradução (ACL) entre os tipos da AWS (`taskToken`, `executionArn`, `payload.error`) e os tipos agnósticos da aplicação (`correlationToken`, `workflowInstanceId`, `payload.failure`).
+5. [`src/infra/aws/sfn-order-workflow.adapter.ts`](./src/infra/aws/sfn-order-workflow.adapter.ts) e [`src/infra/aws/sqs-saga-step.worker.ts`](./src/infra/aws/sqs-saga-step.worker.ts): Conectar os comandos do `@aws-sdk/client-sfn` e `@aws-sdk/client-sqs`.
+6. [`infra/statemachine/order-saga.asl.json`](./infra/statemachine/order-saga.asl.json): Completar os estados da State Machine (`ReserveStock` ➔ `ProcessPayment` ➔ `CreateShipment` ➔ `ConfirmOrder` e os rollbacks `RefundPayment` ➔ `ReleaseStock` ➔ `CancelOrder`) e rodar `cd infra && terraform apply -auto-approve`.
+
+> **Dica:** A qualquer momento você pode comparar sua implementação com o gabarito na `master`:
+> ```bash
+> git diff master -- src/modules/order/application/execute-saga-step.use-case.ts
+> ```
+
+---
+
+## 3. Como Testar Cada Etapa e os Rollbacks (`curl`)
 
 Antes de começar (ou entre um teste e outro), você pode conferir o estoque inicial ou resetar o banco:
 
@@ -73,7 +114,7 @@ Antes de começar (ou entre um teste e outro), você pode conferir o estoque ini
 # Ver saldo atual do estoque (SKU-100 começa com availableQuantity = 10, reservedQuantity = 0)
 curl -s http://localhost:3000/stock | jq
 
-# Resetar todas as tabelas do banco para o estado inicial a qualquer momento
+# Resetar todas as tabelas do PostgreSQL para o estado inicial a qualquer momento
 curl -s -X POST http://localhost:3000/db/reset | jq
 ```
 
@@ -81,7 +122,7 @@ curl -s -X POST http://localhost:3000/db/reset | jq
 
 ### Cenário 1: Caminho Feliz (`ReserveStock` ➔ `ProcessPayment` ➔ `CreateShipment` ➔ `ConfirmOrder`)
 
-**1. Criar o pedido:**
+**1. Bater no endpoint de criação do pedido:**
 ```bash
 curl -s -X POST http://localhost:3000/orders \
   -H "Content-Type: application/json" \
@@ -105,14 +146,15 @@ curl -s http://localhost:3000/orders/<ORDER_ID> | jq
 - `domainState.currentSkuStock`: `availableQuantity: 8`, `reservedQuantity: 2`
 - `domainState.payment.status`: `"APPROVED"`
 - `domainState.shipment.status`: `"DISPATCHED"`
+- `workflowExecution.status`: `"COMPLETED"`
 - `transactionalMessaging.inboxProcessedSteps`: 4 steps processados (`RESERVE_STOCK`, `PROCESS_PAYMENT`, `CREATE_SHIPMENT`, `CONFIRM_ORDER`)
-- `distributedTracing.traceIds`: `["1000000000000000001"]` (o mesmo `traceId` em todos os spans e envelopes `MessageWrapper`!)
+- `distributedTracing.traceIds`: `["1000000000000000001"]`
 
 ---
 
 ### Cenário 2: Falha no Passo 1 — Estoque Insuficiente (`ReserveStock [ERR]` ➔ `CancelOrder`)
 
-Solicitamos `quantity: 50` (maior que o saldo disponível):
+Solicitamos `quantity: 50` (maior que o saldo disponível de 10):
 
 ```bash
 curl -s -X POST http://localhost:3000/orders \
@@ -128,8 +170,8 @@ curl -s -X POST http://localhost:3000/orders \
 **Validar o resultado (`GET /orders/<ORDER_ID>` e `GET /stock`):**
 - `order.status`: `"CANCELLED"`
 - `order.cancellationReason`: `"INSUFFICIENT_STOCK: Insufficient stock for SKU 'SKU-100'..."`
+- `workflowExecution.status`: `"ROLLED_BACK"`
 - `transactionalMessaging.inboxProcessedSteps`: apenas `RESERVE_STOCK` (`ERR`) e `CANCEL_ORDER` (`OK`).
-- O saldo do `SKU-100` em `GET /stock` permanece intacto.
 
 ---
 
@@ -193,16 +235,33 @@ curl -s -X POST http://localhost:3000/orders \
 
 ---
 
-## 4. Como Inspecionar o Banco de Dados PostgreSQL (`psql` e `GET /db`)
+## 4. Como Inspecionar o MiniStack (AWS CLI) e o Banco PostgreSQL (`psql`)
 
-### 4.1 Consultando diretamente no PostgreSQL via `psql`
-
-Com o `docker compose up -d` rodando, você pode inspecionar as tabelas reais do **Transactional Outbox**, **Transactional Inbox** e de cada domínio direto no PostgreSQL:
-
+### 4.1 Inspecionar a State Machine e as Execuções no MiniStack via AWS CLI
 ```bash
-# 1. Ver eventos da Transactional Outbox (START_ORDER_SAGA, SFN_TASK_SUCCESS, SFN_TASK_FAILURE)
+# 1. Listar as State Machines criadas pelo Terraform no MiniStack
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
+  stepfunctions list-state-machines | jq
+
+# 2. Listar todas as execuções da Order Saga no MiniStack
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
+  stepfunctions list-executions \
+  --state-machine-arn arn:aws:states:us-east-1:000000000000:stateMachine:order-saga-state-machine | jq
+
+# 3. Ver o histórico passo a passo de uma execução específica no Step Functions
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
+  stepfunctions get-execution-history \
+  --execution-arn arn:aws:states:us-east-1:000000000000:execution:order-saga-state-machine:<ORDER_ID> | jq
+```
+
+### 4.2 Inspecionar as Tabelas Reais no PostgreSQL via `psql`
+```bash
+# 1. Ver eventos da Transactional Outbox (ORDER_WORKFLOW_REQUESTED, WORKFLOW_STEP_COMPLETED, WORKFLOW_STEP_FAILED)
 docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
-  "SELECT id, order_id, event_type, status, created_at, published_at FROM outbox_messages ORDER BY created_at;"
+  "SELECT id, order_id, event_type, status, workflow_instance_id, created_at, published_at FROM outbox_messages ORDER BY created_at;"
 
 # 2. Ver chaves de idempotência na Transactional Inbox (PRIMARY KEY order_id:step_name)
 docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
@@ -217,43 +276,7 @@ docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
   "SELECT id, sku, quantity, amount, zip_code, status, cancellation_reason FROM orders; SELECT id, order_id, amount, status, refunded_at FROM payments; SELECT id, order_id, zip_code, status, tracking_code FROM shipments;"
 ```
 
-### 4.2 Testando o Transactional Outbox "Pausado" (`?wait=false`)
-Se você quiser ver a mensagem gravada como `PENDING` na tabela `outbox_messages` no mesmo milissegundo em que o `POST /orders` faz `COMMIT` (antes do worker publicar):
+### 4.3 Inspecionar via Endpoint HTTP (`GET /db`)
 ```bash
-DISABLE_BACKGROUND_WORKERS=true bun run start:dev
-# Em outro terminal:
-curl -s -X POST "http://localhost:3000/orders?wait=false" \
-  -H "Content-Type: application/json" \
-  -d '{"sku": "SKU-100", "quantity": 2, "amount": 450, "zipCode": "01001-000"}' | jq
-
-# Consulte no Postgres: você verá Order = PENDING e Outbox = PENDING na mesma transação ACID!
-docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
-  "SELECT id, order_id, event_type, status FROM outbox_messages;"
-```
-
-### 4.3 Consultando via Endpoint HTTP (`GET /db`)
-
-Você também pode inspecionar todas as tabelas (e qual engine está ativa em `databaseEngine: "postgresql" | "in-memory"`) via HTTP:
-
-```bash
-# Dump completo de todas as tabelas
 curl -s http://localhost:3000/db | jq
-
-# Consultar apenas a tabela de Pedidos (orders)
-curl -s http://localhost:3000/db | jq '.tables.orders'
-
-# Consultar saldo de estoque e histórico de reservas (stock_items e stock_reservations)
-curl -s http://localhost:3000/db | jq '.tables.stock_items, .tables.stock_reservations'
-
-# Consultar tabela de Pagamentos (payments) e Envios (shipments)
-curl -s http://localhost:3000/db | jq '.tables.payments, .tables.shipments'
-
-# Consultar a Transactional Inbox (chaves de idempotência orderId:stepName + MessageWrapper)
-curl -s http://localhost:3000/db | jq '.tables.inbox_messages'
-
-# Consultar a Transactional Outbox (START_ORDER_SAGA, SFN_TASK_SUCCESS, SFN_TASK_FAILURE)
-curl -s http://localhost:3000/db | jq '.tables.outbox_messages'
-
-# Consultar todos os Spans do Datadog (traceId, spanId, parentSpanId, operationName, tags)
-curl -s http://localhost:3000/db | jq '.tables.telemetry_spans'
 ```
