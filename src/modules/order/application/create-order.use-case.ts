@@ -92,7 +92,7 @@ export class CreateOrderUseCase {
           const wrapper = createMessageWrapper<StartSagaPayload>({
             payload: sagaPayload,
             correlationId: order.id,
-            source: 'order-service:CreateOrderUseCase',
+            source: 'order-module:CreateOrderUseCase',
             traceContext: traceCarrier,
           });
 
@@ -100,7 +100,7 @@ export class CreateOrderUseCase {
           await outbox.save({
             id: outboxMessageId,
             orderId: order.id,
-            eventType: 'START_ORDER_SAGA',
+            eventType: 'ORDER_WORKFLOW_REQUESTED',
             status: 'PENDING',
             wrapper,
             createdAt: new Date().toISOString(),

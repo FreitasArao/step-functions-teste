@@ -2,43 +2,42 @@ import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type {
   StartSagaPayload,
-  StepFunctionsExecutionSummary,
+  WorkflowExecutionSummary,
 } from '../../modules/order/domain/order-workflow.port.js';
 import type { DomainError } from '../../shared/core/domain-error.js';
 import type {
   MessageWrapper,
   SagaStepName,
 } from '../../shared/messaging/message-wrapper.js';
-import type { SagaStatePayload } from './sqs-saga-step.worker.js';
+import type { AwsSfnSqsTaskEnvelope } from './translators/sfn-acl.translator.js';
 
 interface ActiveExecution {
   readonly executionArn: string;
   readonly orderId: string;
   currentStep: SagaStepName;
-  status: StepFunctionsExecutionSummary['status'];
+  status: WorkflowExecutionSummary['status'];
   stateJson: {
     metadata: MessageWrapper<StartSagaPayload>['metadata'];
-    payload: SagaStatePayload;
+    payload: AwsSfnSqsTaskEnvelope['payload'];
   };
-  readonly startDate: string;
-  stopDate?: string;
-  error?: string;
-  cause?: string;
+  readonly startedAt: string;
+  finishedAt?: string;
+  failureCode?: string;
+  failureReason?: string;
 }
 
 /**
- * Interprets the exact transitions of infra/statemachine/order-saga.asl.json
- * when MiniStack container is offline or during in-process E2E verification,
- * enqueueing the identical SQS MessageWrapper envelopes with taskTokens.
+ * Local in-process interpreter for infra/statemachine/order-saga.asl.json
+ * Produces raw AWS SQS envelopes that are translated by AwsStepFunctionsTranslator.
  */
 @Injectable()
 export class AslLocalEngineService {
   private readonly executionsByOrder = new Map<string, ActiveExecution>();
   private readonly executionsByToken = new Map<string, ActiveExecution>();
-  private readonly localSqsBuffer: MessageWrapper<SagaStatePayload>[] = [];
+  private readonly rawSqsQueueBuffer: string[] = [];
 
   startExecution(wrapper: MessageWrapper<StartSagaPayload>): {
-    executionArn: string;
+    workflowInstanceId: string;
   } {
     const orderId = wrapper.payload.orderId;
     const executionArn = `arn:aws:states:us-east-1:000000000000:execution:order-saga-state-machine:${orderId}`;
@@ -52,12 +51,12 @@ export class AslLocalEngineService {
         metadata: { ...wrapper.metadata },
         payload: { ...wrapper.payload },
       },
-      startDate: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
     };
 
     this.executionsByOrder.set(orderId, execution);
     this.enqueueStep(execution, 'RESERVE_STOCK');
-    return { executionArn };
+    return { workflowInstanceId: executionArn };
   }
 
   private enqueueStep(
@@ -68,7 +67,7 @@ export class AslLocalEngineService {
     const taskToken = `task_token_${execution.orderId}_${stepName}_${randomUUID().slice(0, 6)}`;
     this.executionsByToken.set(taskToken, execution);
 
-    const sqsMessageBody: MessageWrapper<SagaStatePayload> = {
+    const rawEnvelope: AwsSfnSqsTaskEnvelope = {
       stepName,
       idempotencyKey: `${execution.orderId}:${stepName}`,
       taskToken,
@@ -76,11 +75,11 @@ export class AslLocalEngineService {
       payload: structuredClone(execution.stateJson.payload),
     };
 
-    this.localSqsBuffer.push(sqsMessageBody);
+    this.rawSqsQueueBuffer.push(JSON.stringify(rawEnvelope));
   }
 
-  dequeueMessages(max = 5): MessageWrapper<SagaStatePayload>[] {
-    return this.localSqsBuffer.splice(0, max);
+  dequeueRawSqsBodies(max = 5): string[] {
+    return this.rawSqsQueueBuffer.splice(0, max);
   }
 
   handleSendTaskSuccess(taskToken: string, output: unknown): void {
@@ -111,29 +110,27 @@ export class AslLocalEngineService {
 
       case 'CONFIRM_ORDER':
         payload.confirmation = output;
-        execution.status = 'SUCCEEDED';
-        execution.stopDate = new Date().toISOString();
+        execution.status = 'COMPLETED';
+        execution.finishedAt = new Date().toISOString();
         break;
 
       case 'REFUND_PAYMENT':
-        // Rollback Level 2 cascades into Rollback Level 1 (ReleaseStock)
         payload.paymentRefund = output;
         this.enqueueStep(execution, 'RELEASE_STOCK');
         break;
 
       case 'RELEASE_STOCK':
-        // Rollback Level 1 cascades into CancelOrder
         payload.stockRelease = output;
         this.enqueueStep(execution, 'CANCEL_ORDER');
         break;
 
       case 'CANCEL_ORDER':
         payload.cancellation = output;
-        execution.status = 'FAILED';
-        execution.error = 'ORDER_SAGA_ROLLED_BACK';
-        execution.cause =
+        execution.status = 'ROLLED_BACK';
+        execution.failureCode = 'ORDER_SAGA_ROLLED_BACK';
+        execution.failureReason =
           'Order saga failed and all compensations were executed.';
-        execution.stopDate = new Date().toISOString();
+        execution.finishedAt = new Date().toISOString();
         break;
     }
   }
@@ -154,7 +151,6 @@ export class AslLocalEngineService {
       metadata: error.metadata ?? {},
     });
 
-    // ASL Catch with ResultPath: "$.payload.error"
     payload.error = {
       Error: error.code,
       Cause: causeStr,
@@ -162,53 +158,44 @@ export class AslLocalEngineService {
 
     switch (step) {
       case 'RESERVE_STOCK':
-        // Step 1 Failure -> goes directly to CancelOrder
         this.enqueueStep(execution, 'CANCEL_ORDER');
         break;
 
       case 'PROCESS_PAYMENT':
-        // Step 2 Failure -> Rollback Level 1: ReleaseStock -> CancelOrder
         this.enqueueStep(execution, 'RELEASE_STOCK');
         break;
 
       case 'CREATE_SHIPMENT':
-        // Step 3 Failure -> Rollback Level 2 (Cascade): RefundPayment -> ReleaseStock -> CancelOrder
         this.enqueueStep(execution, 'REFUND_PAYMENT');
         break;
 
       default:
         execution.status = 'FAILED';
-        execution.error = error.code;
-        execution.cause = causeStr;
-        execution.stopDate = new Date().toISOString();
+        execution.failureCode = error.code;
+        execution.failureReason = causeStr;
+        execution.finishedAt = new Date().toISOString();
         break;
     }
   }
 
-  getExecutionSummary(orderId: string): StepFunctionsExecutionSummary | null {
+  getExecutionSummary(orderId: string): WorkflowExecutionSummary | null {
     const exec = this.executionsByOrder.get(orderId);
     if (!exec) {
       return null;
     }
     return {
-      executionArn: exec.executionArn,
+      workflowInstanceId: exec.executionArn,
       status: exec.status,
-      startDate: exec.startDate,
-      ...(exec.stopDate ? { stopDate: exec.stopDate } : {}),
-      ...(exec.error ? { error: exec.error } : {}),
-      ...(exec.cause ? { cause: exec.cause } : {}),
+      startedAt: exec.startedAt,
+      ...(exec.finishedAt ? { finishedAt: exec.finishedAt } : {}),
+      ...(exec.failureCode ? { failureCode: exec.failureCode } : {}),
+      ...(exec.failureReason ? { failureReason: exec.failureReason } : {}),
     };
-  }
-
-  getAllExecutions(): StepFunctionsExecutionSummary[] {
-    return Array.from(this.executionsByOrder.keys())
-      .map((orderId) => this.getExecutionSummary(orderId))
-      .filter((item): item is StepFunctionsExecutionSummary => item !== null);
   }
 
   clear(): void {
     this.executionsByOrder.clear();
     this.executionsByToken.clear();
-    this.localSqsBuffer.length = 0;
+    this.rawSqsQueueBuffer.length = 0;
   }
 }

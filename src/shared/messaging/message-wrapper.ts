@@ -28,10 +28,13 @@ export type SagaStepName =
   | 'RELEASE_STOCK'
   | 'CANCEL_ORDER';
 
+/**
+ * Orchestrator-agnostic MessageWrapper.
+ * Knows nothing about AWS Step Functions or SQS tokens.
+ */
 export interface MessageWrapper<TPayload = unknown> {
   readonly stepName?: SagaStepName;
   readonly idempotencyKey?: string;
-  readonly taskToken?: string;
   readonly metadata: MessageMetadata;
   readonly payload: TPayload;
 }
@@ -44,13 +47,11 @@ export function createMessageWrapper<TPayload>(params: {
   traceContext: TraceContextCarrier;
   stepName?: SagaStepName;
   idempotencyKey?: string;
-  taskToken?: string;
 }): MessageWrapper<TPayload> {
   const messageId = randomUUID();
   return {
     ...(params.stepName ? { stepName: params.stepName } : {}),
     ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
-    ...(params.taskToken ? { taskToken: params.taskToken } : {}),
     metadata: {
       messageId,
       correlationId: params.correlationId,

@@ -1,5 +1,6 @@
 -- =============================================================================
 -- Order Saga + Transactional Outbox & Inbox Schema (PostgreSQL 16)
+-- 100% Cloud & Orchestrator Agnostic Schema
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -68,10 +69,10 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
   order_id VARCHAR(64) NOT NULL,
   event_type VARCHAR(64) NOT NULL,
   status VARCHAR(32) NOT NULL,
-  task_token TEXT,
+  correlation_token TEXT,
   error_details JSONB,
   wrapper JSONB NOT NULL,
-  execution_arn TEXT,
+  workflow_instance_id TEXT,
   created_at TIMESTAMPTZ NOT NULL,
   published_at TIMESTAMPTZ
 );

@@ -1,6 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import {
-   type RecordedSpan,
+  type RecordedSpan,
   TELEMETRY_PORT,
   type TelemetryPort,
 } from '../../../infra/telemetry/tracer.js';
@@ -37,7 +37,7 @@ import {
 import {
   ORDER_WORKFLOW_PORT,
   type OrderWorkflowPort,
-  type StepFunctionsExecutionSummary,
+  type WorkflowExecutionSummary,
 } from '../domain/order-workflow.port.js';
 import type { OrderProps } from '../domain/order.entity.js';
 import { OrderNotFoundError } from '../domain/order.errors.js';
@@ -54,7 +54,7 @@ export interface OrderDiagnosticsOutput {
     readonly payment: PaymentProps | null;
     readonly shipment: ShipmentProps | null;
   };
-  readonly stepFunctionsExecution: StepFunctionsExecutionSummary;
+  readonly workflowExecution: WorkflowExecutionSummary;
   readonly transactionalMessaging: {
     readonly inboxProcessedSteps: InboxMessage[];
     readonly outboxEvents: OutboxMessage[];
@@ -102,7 +102,7 @@ export class GetOrderDiagnosticsUseCase {
       shipment,
       inboxMessages,
       outboxMessages,
-      executionStatusResult,
+      workflowStatusResult,
     ] = await Promise.all([
       this.stockRepository.findReservationByOrderId(orderId),
       this.stockRepository.findBySku(order.sku),
@@ -110,7 +110,7 @@ export class GetOrderDiagnosticsUseCase {
       this.shipmentRepository.findByOrderId(orderId),
       this.inboxRepository.findByOrderId(orderId),
       this.outboxRepository.findByOrderId(orderId),
-      this.orderWorkflow.getExecutionStatus(orderId),
+      this.orderWorkflow.getWorkflowStatus(orderId),
     ]);
 
     const spans = this.telemetry.getSpansByCorrelationId(orderId);
@@ -124,8 +124,8 @@ export class GetOrderDiagnosticsUseCase {
         payment: payment ? payment.toJSON() : null,
         shipment: shipment ? shipment.toJSON() : null,
       },
-      stepFunctionsExecution: executionStatusResult.isOk()
-        ? executionStatusResult.value
+      workflowExecution: workflowStatusResult.isOk()
+        ? workflowStatusResult.value
         : { status: 'NOT_STARTED' },
       transactionalMessaging: {
         inboxProcessedSteps: inboxMessages,

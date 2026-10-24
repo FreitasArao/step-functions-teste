@@ -40,10 +40,10 @@ interface OutboxRow {
   order_id: string;
   event_type: OutboxEventType;
   status: OutboxStatus;
-  task_token: string | null;
+  correlation_token: string | null;
   error_details: DomainError | null;
   wrapper: MessageWrapper<unknown>;
-  execution_arn: string | null;
+  workflow_instance_id: string | null;
   created_at: Date | string;
   published_at: Date | string | null;
 }
@@ -70,9 +70,13 @@ function mapOutboxRow(row: OutboxRow): OutboxMessage {
     eventType: row.event_type,
     status: row.status,
     wrapper: row.wrapper,
-    ...(row.task_token ? { taskToken: row.task_token } : {}),
+    ...(row.correlation_token
+      ? { correlationToken: row.correlation_token }
+      : {}),
     ...(row.error_details ? { errorDetails: row.error_details } : {}),
-    ...(row.execution_arn ? { executionArn: row.execution_arn } : {}),
+    ...(row.workflow_instance_id
+      ? { workflowInstanceId: row.workflow_instance_id }
+      : {}),
     createdAt:
       row.created_at instanceof Date
         ? row.created_at.toISOString()
@@ -179,10 +183,10 @@ export class PostgresOutboxRepository implements OutboxRepositoryPort {
         order_id,
         event_type,
         status,
-        task_token,
+        correlation_token,
         error_details,
         wrapper,
-        execution_arn,
+        workflow_instance_id,
         created_at,
         published_at
       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10)`,
@@ -191,10 +195,10 @@ export class PostgresOutboxRepository implements OutboxRepositoryPort {
         message.orderId,
         message.eventType,
         message.status,
-        message.taskToken ?? null,
+        message.correlationToken ?? null,
         message.errorDetails ? JSON.stringify(message.errorDetails) : null,
         JSON.stringify(message.wrapper),
-        message.executionArn ?? null,
+        message.workflowInstanceId ?? null,
         message.createdAt,
         message.publishedAt ?? null,
       ],
@@ -218,7 +222,7 @@ export class PostgresOutboxRepository implements OutboxRepositoryPort {
 
   async markPublished(
     id: string,
-    metadata?: { executionArn?: string },
+    metadata?: { workflowInstanceId?: string },
   ): Promise<void> {
     if (!this.db.isPostgresActive()) {
       return this.fallbackMemory.markPublished(id, metadata);
@@ -228,9 +232,9 @@ export class PostgresOutboxRepository implements OutboxRepositoryPort {
       `UPDATE outbox_messages
        SET status = 'PUBLISHED',
            published_at = NOW(),
-           execution_arn = COALESCE($2, execution_arn)
+           workflow_instance_id = COALESCE($2, workflow_instance_id)
        WHERE id = $1`,
-      [id, metadata?.executionArn ?? null],
+      [id, metadata?.workflowInstanceId ?? null],
     );
   }
 

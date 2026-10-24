@@ -64,7 +64,7 @@ export class InMemoryOutboxRepository implements OutboxRepositoryPort {
 
   async markPublished(
     id: string,
-    metadata?: { executionArn?: string },
+    metadata?: { workflowInstanceId?: string },
   ): Promise<void> {
     const current = this.items.get(id);
     if (!current) {
@@ -74,7 +74,9 @@ export class InMemoryOutboxRepository implements OutboxRepositoryPort {
       ...current,
       status: 'PUBLISHED',
       publishedAt: new Date().toISOString(),
-      ...(metadata?.executionArn ? { executionArn: metadata.executionArn } : {}),
+      ...(metadata?.workflowInstanceId
+        ? { workflowInstanceId: metadata.workflowInstanceId }
+        : {}),
     });
   }
 

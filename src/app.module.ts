@@ -13,6 +13,7 @@ import { OutboxRelayWorker } from './infra/aws/outbox-relay.worker.js';
 import { SagaPipelineRunnerService } from './infra/aws/saga-pipeline-runner.service.js';
 import { StepFunctionsOrderWorkflowAdapter } from './infra/aws/sfn-order-workflow.adapter.js';
 import { SqsSagaStepWorker } from './infra/aws/sqs-saga-step.worker.js';
+import { AwsStepFunctionsTranslator } from './infra/aws/translators/sfn-acl.translator.js';
 import { PostgresDatabaseService } from './infra/database/postgres-client.provider.js';
 import {
   PostgresInboxRepository,
@@ -26,7 +27,9 @@ import {
 import { CancelOrderUseCase } from './modules/order/application/cancel-order.use-case.js';
 import { ConfirmOrderUseCase } from './modules/order/application/confirm-order.use-case.js';
 import { CreateOrderUseCase } from './modules/order/application/create-order.use-case.js';
+import { ExecuteSagaStepUseCase } from './modules/order/application/execute-saga-step.use-case.js';
 import { GetOrderDiagnosticsUseCase } from './modules/order/application/get-order-diagnostics.use-case.js';
+import { RelayOutboxUseCase } from './modules/order/application/relay-outbox.use-case.js';
 import { ORDER_WORKFLOW_PORT } from './modules/order/domain/order-workflow.port.js';
 import { ORDER_REPOSITORY_PORT } from './modules/order/domain/order.repository.port.js';
 import { OrderController } from './modules/order/infra/http/order.controller.js';
@@ -123,18 +126,20 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       useExisting: PostgresShipmentRepository,
     },
 
-    // Domain Use Cases (Pure Business Logic with Result Pattern)
+    // Domain & Application Use Cases (100% Agnostic of AWS/StepFunctions/SQS)
     CreateOrderUseCase,
     ConfirmOrderUseCase,
     CancelOrderUseCase,
     GetOrderDiagnosticsUseCase,
+    ExecuteSagaStepUseCase,
+    RelayOutboxUseCase,
     ReserveStockUseCase,
     ReleaseStockUseCase,
     ProcessPaymentUseCase,
     RefundPaymentUseCase,
     CreateShipmentUseCase,
 
-    // AWS Step Functions & SQS Clients + Adapters + Workers
+    // AWS Translation Layer (ACL) + Step Functions & SQS Adapters + Workers
     {
       provide: SFN_CLIENT,
       useFactory: createSfnClient,
@@ -143,6 +148,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       provide: SQS_CLIENT,
       useFactory: createSqsClient,
     },
+    AwsStepFunctionsTranslator,
     AslLocalEngineService,
     StepFunctionsOrderWorkflowAdapter,
     {

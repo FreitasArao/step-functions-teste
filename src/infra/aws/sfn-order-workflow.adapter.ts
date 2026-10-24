@@ -10,13 +10,14 @@ import { Inject, Injectable } from '@nestjs/common';
 import type {
   OrderWorkflowPort,
   StartSagaPayload,
-  StepFunctionsExecutionSummary,
+  WorkflowExecutionSummary,
 } from '../../modules/order/domain/order-workflow.port.js';
 import type { DomainError } from '../../shared/core/domain-error.js';
 import { Result } from '../../shared/core/result.js';
 import type { MessageWrapper } from '../../shared/messaging/message-wrapper.js';
 import { AslLocalEngineService } from './asl-local-engine.service.js';
 import { SFN_CLIENT } from './aws-clients.provider.js';
+import { AwsStepFunctionsTranslator } from './translators/sfn-acl.translator.js';
 
 export class StepFunctionsInfraError implements DomainError {
   readonly code = 'STEP_FUNCTIONS_INFRA_ERROR';
@@ -37,6 +38,7 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
   constructor(
     @Inject(SFN_CLIENT)
     private readonly sfnClient: SFNClient,
+    private readonly translator: AwsStepFunctionsTranslator,
     private readonly aslLocalEngine: AslLocalEngineService,
   ) {}
 
@@ -78,14 +80,14 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
     }
   }
 
-  async startSagaExecution(
+  async startOrderWorkflow(
     wrapper: MessageWrapper<StartSagaPayload>,
-  ): Promise<Result<{ executionArn: string }, DomainError>> {
+  ): Promise<Result<{ workflowInstanceId: string }, DomainError>> {
     if (this.shouldUseLocalEngine()) {
       const localExec = this.aslLocalEngine.startExecution(wrapper);
       this.executionArnByOrder.set(
         wrapper.payload.orderId,
-        localExec.executionArn,
+        localExec.workflowInstanceId,
       );
       return Result.ok(localExec);
     }
@@ -93,18 +95,18 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
     const arnResult = await this.resolveStateMachineArn();
     if (arnResult.isOk()) {
       try {
+        const commandInput = this.translator.toStartExecutionInput(
+          arnResult.value,
+          wrapper,
+        );
         const response = await this.sfnClient.send(
-          new StartExecutionCommand({
-            stateMachineArn: arnResult.value,
-            name: wrapper.payload.orderId,
-            input: JSON.stringify(wrapper),
-          }),
+          new StartExecutionCommand(commandInput),
         );
         const executionArn =
           response.executionArn ??
           `${arnResult.value.replace(':stateMachine:', ':execution:')}:${wrapper.payload.orderId}`;
         this.executionArnByOrder.set(wrapper.payload.orderId, executionArn);
-        return Result.ok({ executionArn });
+        return Result.ok({ workflowInstanceId: executionArn });
       } catch {
         // Fallback to local ASL engine if MiniStack endpoint is unreachable
       }
@@ -113,73 +115,62 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
     const fallbackExec = this.aslLocalEngine.startExecution(wrapper);
     this.executionArnByOrder.set(
       wrapper.payload.orderId,
-      fallbackExec.executionArn,
+      fallbackExec.workflowInstanceId,
     );
     return Result.ok(fallbackExec);
   }
 
-  async sendTaskSuccess(params: {
-    taskToken: string;
+  async completeWorkflowStep(params: {
+    correlationToken: string;
     output: unknown;
   }): Promise<Result<void, DomainError>> {
     if (
       this.shouldUseLocalEngine() ||
-      params.taskToken.startsWith('task_token_')
+      params.correlationToken.startsWith('task_token_')
     ) {
       this.aslLocalEngine.handleSendTaskSuccess(
-        params.taskToken,
+        params.correlationToken,
         params.output,
       );
       return Result.ok(undefined);
     }
 
     try {
-      await this.sfnClient.send(
-        new SendTaskSuccessCommand({
-          taskToken: params.taskToken,
-          output: JSON.stringify(params.output ?? {}),
-        }),
-      );
+      const commandInput = this.translator.toSendTaskSuccessInput(params);
+      await this.sfnClient.send(new SendTaskSuccessCommand(commandInput));
       return Result.ok(undefined);
     } catch (err) {
       return Result.err(new StepFunctionsInfraError('SendTaskSuccess', err));
     }
   }
 
-  async sendTaskFailure(params: {
-    taskToken: string;
+  async failWorkflowStep(params: {
+    correlationToken: string;
     error: DomainError;
   }): Promise<Result<void, DomainError>> {
     if (
       this.shouldUseLocalEngine() ||
-      params.taskToken.startsWith('task_token_')
+      params.correlationToken.startsWith('task_token_')
     ) {
-      this.aslLocalEngine.handleSendTaskFailure(params.taskToken, params.error);
+      this.aslLocalEngine.handleSendTaskFailure(
+        params.correlationToken,
+        params.error,
+      );
       return Result.ok(undefined);
     }
 
     try {
-      await this.sfnClient.send(
-        new SendTaskFailureCommand({
-          taskToken: params.taskToken,
-          error: params.error.code,
-          cause: JSON.stringify({
-            code: params.error.code,
-            message: params.error.message,
-            retryable: params.error.retryable ?? false,
-            metadata: params.error.metadata ?? {},
-          }),
-        }),
-      );
+      const commandInput = this.translator.toSendTaskFailureInput(params);
+      await this.sfnClient.send(new SendTaskFailureCommand(commandInput));
       return Result.ok(undefined);
     } catch (err) {
       return Result.err(new StepFunctionsInfraError('SendTaskFailure', err));
     }
   }
 
-  async getExecutionStatus(
+  async getWorkflowStatus(
     orderId: string,
-  ): Promise<Result<StepFunctionsExecutionSummary, DomainError>> {
+  ): Promise<Result<WorkflowExecutionSummary, DomainError>> {
     const localSummary = this.aslLocalEngine.getExecutionSummary(orderId);
     if (localSummary) {
       return Result.ok(localSummary);
@@ -194,18 +185,12 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
       const desc = await this.sfnClient.send(
         new DescribeExecutionCommand({ executionArn }),
       );
-      return Result.ok({
-        executionArn,
-        status:
-          (desc.status as StepFunctionsExecutionSummary['status']) ?? 'RUNNING',
-        startDate: desc.startDate?.toISOString(),
-        stopDate: desc.stopDate?.toISOString(),
-        ...(desc.error ? { error: desc.error } : {}),
-        ...(desc.cause ? { cause: desc.cause } : {}),
-      });
+      return Result.ok(
+        this.translator.toWorkflowExecutionSummary(executionArn, desc),
+      );
     } catch {
       return Result.ok({
-        executionArn,
+        workflowInstanceId: executionArn,
         status: 'RUNNING',
       });
     }

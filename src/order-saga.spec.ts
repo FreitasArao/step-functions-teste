@@ -1,8 +1,9 @@
 import { Test, type TestingModule } from '@nestjs/testing';
 import { AppModule } from './app.module.js';
 import { SagaPipelineRunnerService } from './infra/aws/saga-pipeline-runner.service.js';
-import { SqsSagaStepWorker } from './infra/aws/sqs-saga-step.worker.js';
+import { AwsStepFunctionsTranslator } from './infra/aws/translators/sfn-acl.translator.js';
 import { CreateOrderUseCase } from './modules/order/application/create-order.use-case.js';
+import { ExecuteSagaStepUseCase } from './modules/order/application/execute-saga-step.use-case.js';
 import { GetOrderDiagnosticsUseCase } from './modules/order/application/get-order-diagnostics.use-case.js';
 import { OrderController } from './modules/order/infra/http/order.controller.js';
 import {
@@ -15,12 +16,13 @@ import {
   type UnitOfWorkPort,
 } from './shared/messaging/unit-of-work.port.js';
 
-describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Result Pattern & dd-trace', () => {
+describe('Order Saga with Agnostic Domain/Application, AWS ACL Translation Layer, Outbox/Inbox, Result Pattern & dd-trace', () => {
   let moduleRef: TestingModule;
   let createOrderUseCase: CreateOrderUseCase;
+  let executeSagaStepUseCase: ExecuteSagaStepUseCase;
   let getOrderDiagnosticsUseCase: GetOrderDiagnosticsUseCase;
+  let awsTranslator: AwsStepFunctionsTranslator;
   let pipelineRunner: SagaPipelineRunnerService;
-  let sqsWorker: SqsSagaStepWorker;
   let stockRepository: StockRepositoryPort;
   let unitOfWork: UnitOfWorkPort;
   let orderController: OrderController;
@@ -34,9 +36,10 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
     }).compile();
 
     createOrderUseCase = moduleRef.get(CreateOrderUseCase);
+    executeSagaStepUseCase = moduleRef.get(ExecuteSagaStepUseCase);
     getOrderDiagnosticsUseCase = moduleRef.get(GetOrderDiagnosticsUseCase);
+    awsTranslator = moduleRef.get(AwsStepFunctionsTranslator);
     pipelineRunner = moduleRef.get(SagaPipelineRunnerService);
-    sqsWorker = moduleRef.get(SqsSagaStepWorker);
     stockRepository = moduleRef.get(STOCK_REPOSITORY_PORT);
     unitOfWork = moduleRef.get(UNIT_OF_WORK_PORT);
     orderController = moduleRef.get(OrderController);
@@ -79,7 +82,7 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
     expect(diag.domainState.currentSkuStock?.reservedQuantity).toBe(2);
     expect(diag.domainState.payment?.status).toBe('APPROVED');
     expect(diag.domainState.shipment?.status).toBe('DISPATCHED');
-    expect(diag.stepFunctionsExecution.status).toBe('SUCCEEDED');
+    expect(diag.workflowExecution.status).toBe('COMPLETED');
 
     // Verify Inbox steps
     const inboxSteps = diag.transactionalMessaging.inboxProcessedSteps.map(
@@ -92,12 +95,15 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
       'CONFIRM_ORDER',
     ]);
 
-    // Verify Outbox events were all PUBLISHED
+    // Verify Outbox events were all PUBLISHED with agnostic event types
     expect(
       diag.transactionalMessaging.outboxEvents.every(
         (o) => o.status === 'PUBLISHED',
       ),
     ).toBe(true);
+    expect(diag.transactionalMessaging.outboxEvents[0]?.eventType).toBe(
+      'ORDER_WORKFLOW_REQUESTED',
+    );
 
     // Verify Distributed Tracing: single shared traceId across the entire flow
     expect(diag.distributedTracing.traceIds).toEqual([rootTraceId]);
@@ -134,6 +140,7 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
     expect(diag.domainState.currentSkuStock?.reservedQuantity).toBe(0);
     expect(diag.domainState.payment).toBeNull();
     expect(diag.domainState.shipment).toBeNull();
+    expect(diag.workflowExecution.status).toBe('ROLLED_BACK');
 
     const inboxSteps = diag.transactionalMessaging.inboxProcessedSteps.map(
       (i) => ({ step: i.stepName, outcome: i.outcome }),
@@ -172,6 +179,7 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
     expect(diag.domainState.currentSkuStock?.reservedQuantity).toBe(0);
     expect(diag.domainState.payment?.status).toBe('DECLINED');
     expect(diag.domainState.shipment).toBeNull();
+    expect(diag.workflowExecution.status).toBe('ROLLED_BACK');
 
     const inboxSteps = diag.transactionalMessaging.inboxProcessedSteps.map(
       (i) => ({ step: i.stepName, outcome: i.outcome }),
@@ -215,7 +223,7 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
     expect(diag.domainState.currentSkuStock?.availableQuantity).toBe(10);
     expect(diag.domainState.currentSkuStock?.reservedQuantity).toBe(0);
     expect(diag.domainState.shipment?.status).toBe('FAILED');
-    expect(diag.stepFunctionsExecution.status).toBe('FAILED');
+    expect(diag.workflowExecution.status).toBe('ROLLED_BACK');
 
     const inboxSteps = diag.transactionalMessaging.inboxProcessedSteps.map(
       (i) => ({ step: i.stepName, outcome: i.outcome }),
@@ -233,8 +241,20 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
     expect(diag.distributedTracing.traceIds).toEqual([rootTraceId]);
   });
 
-  it('Scenario 5 (Transactional Inbox Idempotency): duplicate SQS message delivery does not reserve stock twice', async () => {
-    const duplicateWrapper = createMessageWrapper({
+  it('Scenario 5 (Transactional Inbox Idempotency + AWS ACL Translation): duplicate SQS message delivery does not reserve stock twice', async () => {
+    const rawSqsBody = JSON.stringify({
+      stepName: 'RESERVE_STOCK',
+      idempotencyKey: 'ord_idempotent_test:RESERVE_STOCK',
+      taskToken: 'aws_sfn_task_token_dup_1',
+      metadata: createMessageWrapper({
+        payload: {},
+        correlationId: 'ord_idempotent_test',
+        source: 'aws-step-functions',
+        traceContext: {
+          'x-datadog-trace-id': '1234567890123456789',
+          'x-datadog-parent-id': '9876543210987654321',
+        },
+      }).metadata,
       payload: {
         orderId: 'ord_idempotent_test',
         sku: 'SKU-100',
@@ -242,24 +262,18 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
         amount: 300,
         zipCode: '01001-000',
       },
-      correlationId: 'ord_idempotent_test',
-      source: 'test-sqs-redelivery',
-      traceContext: {
-        'x-datadog-trace-id': '1234567890123456789',
-        'x-datadog-parent-id': '9876543210987654321',
-      },
-      stepName: 'RESERVE_STOCK',
-      idempotencyKey: 'ord_idempotent_test:RESERVE_STOCK',
-      taskToken: 'task_token_dup_1',
     });
 
-    const firstCall = await sqsWorker.handleStepMessage(duplicateWrapper);
+    // Translate AWS SQS body into agnostic WorkflowStepCommand via ACL
+    const agnosticCommand = awsTranslator.toWorkflowStepCommand(rawSqsBody);
+
+    const firstCall = await executeSagaStepUseCase.execute(agnosticCommand);
     expect(firstCall.isOk()).toBe(true);
     if (firstCall.isOk()) {
       expect(firstCall.value.deduplicated).toBe(false);
     }
 
-    const secondCall = await sqsWorker.handleStepMessage(duplicateWrapper);
+    const secondCall = await executeSagaStepUseCase.execute(agnosticCommand);
     expect(secondCall.isOk()).toBe(true);
     if (secondCall.isOk()) {
       expect(secondCall.value.deduplicated).toBe(true);
@@ -294,7 +308,7 @@ describe('Order Saga with Step Functions, SQS waitForTaskToken, Outbox/Inbox, Re
         await outbox.save({
           id: 'out_tx_rollback_1',
           orderId: 'ord_tx_rollback',
-          eventType: 'SFN_TASK_SUCCESS',
+          eventType: 'WORKFLOW_STEP_COMPLETED',
           status: 'PENDING',
           wrapper,
           createdAt: new Date().toISOString(),
