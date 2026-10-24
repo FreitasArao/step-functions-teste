@@ -1,20 +1,15 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
 import {
   TELEMETRY_PORT,
   type TelemetryPort,
 } from '../../../infra/telemetry/tracer.js';
 import type { DomainError } from '../../../shared/core/domain-error.js';
 import { Result } from '../../../shared/core/result.js';
-import {
-  createMessageWrapper,
-  type TraceContextCarrier,
-} from '../../../shared/messaging/message-wrapper.js';
+import type { TraceContextCarrier } from '../../../shared/messaging/message-wrapper.js';
 import {
   UNIT_OF_WORK_PORT,
   type UnitOfWorkPort,
 } from '../../../shared/messaging/unit-of-work.port.js';
-import type { StartSagaPayload } from '../domain/order-workflow.port.js';
 import { Order, type OrderProps } from '../domain/order.entity.js';
 import {
   ORDER_REPOSITORY_PORT,
@@ -78,39 +73,21 @@ export class CreateOrderUseCase {
         },
       },
       async (traceCarrier) => {
-        return this.unitOfWork.execute(async ({ outbox }) => {
+        return this.unitOfWork.execute(async ({ outbox: _outbox }) => {
           await this.orderRepository.save(order);
 
-          const sagaPayload: StartSagaPayload = {
-            orderId: order.id,
-            sku: order.sku,
-            quantity: order.quantity,
-            amount: order.amount,
-            zipCode: order.zipCode,
-          };
-
-          const wrapper = createMessageWrapper<StartSagaPayload>({
-            payload: sagaPayload,
-            correlationId: order.id,
-            source: 'order-module:CreateOrderUseCase',
-            traceContext: traceCarrier,
-          });
-
-          const outboxMessageId = `out_${randomUUID().slice(0, 8)}`;
-          await outbox.save({
-            id: outboxMessageId,
-            orderId: order.id,
-            eventType: 'ORDER_WORKFLOW_REQUESTED',
-            status: 'PENDING',
-            wrapper,
-            createdAt: new Date().toISOString(),
-          });
+          // TODO (Prática - Transactional Outbox Agnóstico + MessageWrapper):
+          // 1. Monte o StartSagaPayload e crie um MessageWrapper com `createMessageWrapper(...)`
+          // 2. Grave na Outbox (`_outbox.save`) o evento agnóstico:
+          //    - eventType: 'ORDER_WORKFLOW_REQUESTED'
+          //    - status: 'PENDING'
+          //    - wrapper
 
           return Result.ok({
             order: order.toJSON(),
-            outboxMessageId,
+            outboxMessageId: 'todo_outbox_id',
             correlationId: order.id,
-            traceContext: wrapper.metadata.traceContext,
+            traceContext: traceCarrier,
           });
         });
       },

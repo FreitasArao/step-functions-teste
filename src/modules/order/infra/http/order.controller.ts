@@ -12,7 +12,6 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { AslLocalEngineService } from '../../../../infra/aws/asl-local-engine.service.js';
 import { SagaPipelineRunnerService } from '../../../../infra/aws/saga-pipeline-runner.service.js';
 import { PostgresDatabaseService } from '../../../../infra/database/postgres-client.provider.js';
 import {
@@ -64,7 +63,6 @@ export class OrderController {
     private readonly createOrderUseCase: CreateOrderUseCase,
     private readonly getOrderDiagnosticsUseCase: GetOrderDiagnosticsUseCase,
     private readonly pipelineRunner: SagaPipelineRunnerService,
-    private readonly aslLocalEngine: AslLocalEngineService,
     private readonly postgresDb: PostgresDatabaseService,
     private readonly memoryOrders: InMemoryOrderRepository,
     private readonly memoryStock: InMemoryStockRepository,
@@ -203,7 +201,6 @@ export class OrderController {
     this.memoryInbox.clear();
     this.memoryOutbox.clear();
     this.telemetry.clear();
-    this.aslLocalEngine.clear();
 
     return {
       status: 'RESET_COMPLETED',

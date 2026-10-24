@@ -1,9 +1,4 @@
-import {
-  DeleteMessageCommand,
-  GetQueueUrlCommand,
-  ReceiveMessageCommand,
-  type SQSClient,
-} from '@aws-sdk/client-sqs';
+import type { SQSClient } from '@aws-sdk/client-sqs';
 import {
   Inject,
   Injectable,
@@ -14,28 +9,18 @@ import { ExecuteSagaStepUseCase } from '../../modules/order/application/execute-
 import type { WorkflowStepCommand } from '../../modules/order/domain/order-workflow.port.js';
 import type { DomainError } from '../../shared/core/domain-error.js';
 import type { Result } from '../../shared/core/result.js';
-import { AslLocalEngineService } from './asl-local-engine.service.js';
 import { SQS_CLIENT } from './aws-clients.provider.js';
 import { AwsStepFunctionsTranslator } from './translators/sfn-acl.translator.js';
 
-/**
- * Primary / Driving Adapter for AWS SQS.
- * Receives raw SQS messages from Step Functions (.waitForTaskToken),
- * translates them via AwsStepFunctionsTranslator (ACL) into agnostic WorkflowStepCommands,
- * and invokes ExecuteSagaStepUseCase.
- */
 @Injectable()
 export class SqsSagaStepWorker implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
-  private isPolling = false;
-  private cachedQueueUrl?: string;
 
   constructor(
     @Inject(SQS_CLIENT)
-    private readonly sqsClient: SQSClient,
-    private readonly translator: AwsStepFunctionsTranslator,
+    private readonly _sqsClient: SQSClient,
+    private readonly _translator: AwsStepFunctionsTranslator,
     private readonly executeSagaStepUseCase: ExecuteSagaStepUseCase,
-    private readonly aslLocalEngine: AslLocalEngineService,
   ) {}
 
   onModuleInit(): void {
@@ -54,82 +39,15 @@ export class SqsSagaStepWorker implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async resolveQueueUrl(): Promise<string | null> {
-    if (process.env.SQS_QUEUE_URL) {
-      return process.env.SQS_QUEUE_URL;
-    }
-    if (this.cachedQueueUrl) {
-      return this.cachedQueueUrl;
-    }
-    try {
-      const response = await this.sqsClient.send(
-        new GetQueueUrlCommand({ QueueName: 'order-saga-tasks-queue' }),
-      );
-      if (response.QueueUrl) {
-        this.cachedQueueUrl = response.QueueUrl;
-        return response.QueueUrl;
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
   async pollQueueOnce(): Promise<number> {
-    if (this.isPolling) {
-      return 0;
-    }
-    this.isPolling = true;
-    let processedCount = 0;
-
-    try {
-      // 1. Drain any locally buffered raw SQS JSON bodies through the AWS ACL Translator
-      const localBodies = this.aslLocalEngine.dequeueRawSqsBodies(5);
-      for (const rawBody of localBodies) {
-        const command = this.translator.toWorkflowStepCommand(rawBody);
-        await this.executeSagaStepUseCase.execute(command);
-        processedCount += 1;
-      }
-
-      // 2. Poll MiniStack SQS queue if reachable
-      const queueUrl = await this.resolveQueueUrl();
-      if (!queueUrl) {
-        return processedCount;
-      }
-
-      const response = await this.sqsClient.send(
-        new ReceiveMessageCommand({
-          QueueUrl: queueUrl,
-          MaxNumberOfMessages: 5,
-          WaitTimeSeconds: 0,
-        }),
-      );
-
-      for (const sqsMsg of response.Messages ?? []) {
-        if (!sqsMsg.Body) {
-          continue;
-        }
-        // Translate AWS Step Functions SQS JSON -> Agnostic WorkflowStepCommand
-        const command = this.translator.toWorkflowStepCommand(sqsMsg.Body);
-        await this.executeSagaStepUseCase.execute(command);
-
-        if (sqsMsg.ReceiptHandle) {
-          await this.sqsClient.send(
-            new DeleteMessageCommand({
-              QueueUrl: queueUrl,
-              ReceiptHandle: sqsMsg.ReceiptHandle,
-            }),
-          );
-        }
-        processedCount += 1;
-      }
-
-      return processedCount;
-    } catch {
-      return processedCount;
-    } finally {
-      this.isPolling = false;
-    }
+    // TODO (Prática - SQS Adapter + ACL Translator):
+    // 1. Ler mensagens da fila SQS 'order-saga-tasks-queue' (ReceiveMessageCommand)
+    // 2. Traduzir o JSON da AWS para o comando agnóstico:
+    //    `const command = this._translator.toWorkflowStepCommand(sqsMsg.Body)`
+    // 3. Executar o caso de uso agnóstico:
+    //    `await this.executeSagaStepUseCase.execute(command)`
+    // 4. Deletar mensagem da fila (DeleteMessageCommand)
+    return 0;
   }
 
   async handleCommand(

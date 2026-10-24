@@ -2,7 +2,6 @@ import { Module } from '@nestjs/common';
 import { createObserveModule } from '@nestjs/observe';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
-import { AslLocalEngineService } from './infra/aws/asl-local-engine.service.js';
 import {
   createSfnClient,
   createSqsClient,
@@ -149,7 +148,6 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       useFactory: createSqsClient,
     },
     AwsStepFunctionsTranslator,
-    AslLocalEngineService,
     StepFunctionsOrderWorkflowAdapter,
     {
       provide: ORDER_WORKFLOW_PORT,
