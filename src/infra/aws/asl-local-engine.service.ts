@@ -40,6 +40,10 @@ export class AslLocalEngineService {
     workflowInstanceId: string;
   } {
     const orderId = wrapper.payload.orderId;
+    const existing = this.executionsByOrder.get(orderId);
+    if (existing) {
+      return { workflowInstanceId: existing.executionArn };
+    }
     const executionArn = `arn:aws:states:us-east-1:000000000000:execution:order-saga-state-machine:${orderId}`;
 
     const execution: ActiveExecution = {
@@ -80,6 +84,10 @@ export class AslLocalEngineService {
 
   dequeueRawSqsBodies(max = 5): string[] {
     return this.rawSqsQueueBuffer.splice(0, max);
+  }
+
+  requeueRawSqsBody(rawBody: string): void {
+    this.rawSqsQueueBuffer.push(rawBody);
   }
 
   handleSendTaskSuccess(taskToken: string, output: unknown): void {

@@ -43,6 +43,7 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
 
   beforeAll(async () => {
     process.env.DISABLE_BACKGROUND_WORKERS = 'true';
+    process.env.USE_LOCAL_ASL_ENGINE = 'true';
 
     moduleRef = await Test.createTestingModule({
       imports: [AppModule],
@@ -224,9 +225,25 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
       if (!diagResult.isOk()) return;
 
       expect(diagResult.value.order.status).toBe('CONFIRMED');
+      expect(
+        diagResult.value.transactionalMessaging.outboxEvents.map(
+          (e) => e.eventType,
+        ),
+      ).toEqual([
+        'ORDER_CREATED',
+        'WORKFLOW_STEP_COMPLETED',
+        'WORKFLOW_STEP_COMPLETED',
+        'WORKFLOW_STEP_COMPLETED',
+        'WORKFLOW_STEP_COMPLETED',
+      ]);
+      expect(
+        diagResult.value.transactionalMessaging.outboxEvents.every(
+          (e) => e.status === 'PUBLISHED',
+        ),
+      ).toBe(true);
     });
 
-    it('Scenario 5 (Transactional Inbox Idempotency + AWS ACL Translation): duplicate SQS message delivery does not reserve stock twice', async () => {
+    it('Scenario 5 (Transactional Inbox Idempotency + AWS ACL Translation): duplicate SQS message delivery does not reserve stock twice and replays callback to Outbox', async () => {
       const rawSqsBody = JSON.stringify({
         stepName: 'RESERVE_STOCK',
         idempotencyKey: 'ord_idempotent_test:RESERVE_STOCK',
@@ -252,15 +269,26 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
       const agnosticCommand = awsTranslator.toWorkflowStepCommand(rawSqsBody);
       const firstCall = await executeSagaStepUseCase.execute(agnosticCommand);
       expect(firstCall.isOk()).toBe(true);
+      if (firstCall.isOk()) {
+        expect(firstCall.value.deduplicated).toBe(false);
+        expect(firstCall.value.outcome).toBe('OK');
+      }
 
       const secondCall = await executeSagaStepUseCase.execute(agnosticCommand);
       expect(secondCall.isOk()).toBe(true);
       if (secondCall.isOk()) {
         expect(secondCall.value.deduplicated).toBe(true);
+        expect(secondCall.value.outcome).toBe('OK');
       }
 
       const skuItem = await stockRepository.findBySku('SKU-100');
       expect(skuItem?.availableQuantity).toBe(7);
+
+      const dump = await orderController.getDatabaseDump();
+      const outboxForOrder = dump.tables.outbox_messages.filter(
+        (m) => m.orderId === 'ord_idempotent_test',
+      );
+      expect(outboxForOrder).toHaveLength(2);
     });
   });
 });

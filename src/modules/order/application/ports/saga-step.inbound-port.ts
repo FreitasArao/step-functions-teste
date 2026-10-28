@@ -27,8 +27,14 @@ export interface WorkflowStepCommand {
   readonly wrapper: MessageWrapper<SagaStepContextPayload>;
 }
 
+/**
+ * Business outcome of a step. A business failure (e.g. PAYMENT_DECLINED) is a *successful*
+ * processing of the message (outcome = 'ERR'); only infrastructure failures return Result.err,
+ * so the delivering infrastructure can retry the message.
+ */
 export interface ExecuteSagaStepOutput {
   readonly deduplicated: boolean;
+  readonly outcome: 'OK' | 'ERR';
   readonly output?: unknown;
 }
 

@@ -1,10 +1,13 @@
 import {
   DescribeExecutionCommand,
+  ExecutionAlreadyExists,
   ListStateMachinesCommand,
   type SFNClient,
   SendTaskFailureCommand,
   SendTaskSuccessCommand,
   StartExecutionCommand,
+  TaskDoesNotExist,
+  TaskTimedOut,
 } from '@aws-sdk/client-sfn';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type {
@@ -30,6 +33,15 @@ export class StepFunctionsInfraError implements DomainError {
   }
 }
 
+/**
+ * Infrastructure Adapter implementing the agnostic OrderWorkflowPort using AWS Step Functions.
+ * Called exclusively by the Transactional Outbox Relay (`RelayOutboxUseCase`), therefore every
+ * operation is an IDEMPOTENT RECEIVER:
+ * - startOrderWorkflow   -> deterministic execution name (`orderId`); `ExecutionAlreadyExists` == success
+ * - completeWorkflowStep -> `SendTaskSuccessCommand`; `TaskTimedOut` / `TaskDoesNotExist` == no-op success
+ * - failWorkflowStep     -> `SendTaskFailureCommand`; `TaskTimedOut` / `TaskDoesNotExist` == no-op success
+ * Any other infrastructure error returns `Result.err` so the Outbox row stays `PENDING` and is retried.
+ */
 @Injectable()
 export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
   private readonly logger = new Logger(StepFunctionsOrderWorkflowAdapter.name);
@@ -43,7 +55,7 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
     private readonly aslLocalEngine: AslLocalEngineService,
   ) {}
 
-  private shouldUseLocalEngine(): boolean {
+  isLocalEngineMode(): boolean {
     return (
       process.env.USE_LOCAL_ASL_ENGINE === 'true' ||
       process.env.NODE_ENV === 'test'
@@ -85,63 +97,63 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
   async startOrderWorkflow(
     wrapper: MessageWrapper<StartSagaPayload>,
   ): Promise<Result<{ workflowInstanceId: string }, DomainError>> {
-    const arnResult = await this.resolveStateMachineArn();
-    if (arnResult.isOk()) {
-      try {
-        const commandInput = this.translator.toStartExecutionInput(
-          arnResult.value,
-          wrapper,
-        );
-        const response = await this.sfnClient.send(
-          new StartExecutionCommand(commandInput),
-        );
-        const executionArn =
-          response.executionArn ??
-          `${arnResult.value.replace(':stateMachine:', ':execution:')}:${wrapper.payload.orderId}`;
-        this.executionArnByOrder.set(wrapper.payload.orderId, executionArn);
-        this.logger.log(
-          `[StepFunctionsAdapter] StartExecution succeeded -> executionArn=${executionArn}`,
-        );
-        return Result.ok({ workflowInstanceId: executionArn });
-      } catch (err) {
-        if (!this.shouldUseLocalEngine()) {
-          this.logger.error(
-            `[StepFunctionsAdapter] StartExecution failed for orderId=${wrapper.payload.orderId}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return Result.err(
-            new StepFunctionsInfraError('StartExecution', err),
-          );
-        }
-      }
-    } else if (!this.shouldUseLocalEngine()) {
-      this.logger.error(
-        `[StepFunctionsAdapter] ${arnResult.error.message}`,
+    if (this.isLocalEngineMode()) {
+      const localExec = this.aslLocalEngine.startExecution(wrapper);
+      this.executionArnByOrder.set(
+        wrapper.payload.orderId,
+        localExec.workflowInstanceId,
       );
+      return Result.ok(localExec);
+    }
+
+    const arnResult = await this.resolveStateMachineArn();
+    if (arnResult.isErr()) {
+      this.logger.error(`[StepFunctionsAdapter] ${arnResult.error.message}`);
       return Result.err(arnResult.error);
     }
 
-    const fallbackExec = this.aslLocalEngine.startExecution(wrapper);
-    this.executionArnByOrder.set(
-      wrapper.payload.orderId,
-      fallbackExec.workflowInstanceId,
-    );
-    return Result.ok(fallbackExec);
+    const deterministicExecutionArn = `${arnResult.value.replace(':stateMachine:', ':execution:')}:${wrapper.payload.orderId}`;
+
+    try {
+      const commandInput = this.translator.toStartExecutionInput(
+        arnResult.value,
+        wrapper,
+      );
+      const response = await this.sfnClient.send(
+        new StartExecutionCommand(commandInput),
+      );
+      const executionArn = response.executionArn ?? deterministicExecutionArn;
+      this.executionArnByOrder.set(wrapper.payload.orderId, executionArn);
+      this.logger.log(
+        `[StepFunctionsAdapter] StartExecution succeeded -> executionArn=${executionArn}`,
+      );
+      return Result.ok({ workflowInstanceId: executionArn });
+    } catch (err) {
+      if (
+        err instanceof ExecutionAlreadyExists ||
+        (err instanceof Error && err.name === 'ExecutionAlreadyExists')
+      ) {
+        this.executionArnByOrder.set(
+          wrapper.payload.orderId,
+          deterministicExecutionArn,
+        );
+        this.logger.warn(
+          `[StepFunctionsAdapter] Execution '${deterministicExecutionArn}' already exists — duplicate Outbox delivery acknowledged (idempotent).`,
+        );
+        return Result.ok({ workflowInstanceId: deterministicExecutionArn });
+      }
+      this.logger.error(
+        `[StepFunctionsAdapter] StartExecution failed for orderId=${wrapper.payload.orderId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return Result.err(new StepFunctionsInfraError('StartExecution', err));
+    }
   }
 
   async completeWorkflowStep(params: {
     correlationToken: string;
     output: unknown;
   }): Promise<Result<void, DomainError>> {
-    if (params.correlationToken.startsWith('task_token_')) {
-      this.aslLocalEngine.handleSendTaskSuccess(
-        params.correlationToken,
-        params.output,
-      );
-      return Result.ok(undefined);
-    }
-
-    const arnResult = await this.resolveStateMachineArn();
-    if (arnResult.isErr() && this.shouldUseLocalEngine()) {
+    if (this.isLocalEngineMode()) {
       this.aslLocalEngine.handleSendTaskSuccess(
         params.correlationToken,
         params.output,
@@ -157,10 +169,7 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
       );
       return Result.ok(undefined);
     } catch (err) {
-      this.logger.error(
-        `[StepFunctionsAdapter] SendTaskSuccess failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return Result.err(new StepFunctionsInfraError('SendTaskSuccess', err));
+      return this.handleTaskCallbackError('SendTaskSuccess', err);
     }
   }
 
@@ -168,16 +177,7 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
     correlationToken: string;
     error: DomainError;
   }): Promise<Result<void, DomainError>> {
-    if (params.correlationToken.startsWith('task_token_')) {
-      this.aslLocalEngine.handleSendTaskFailure(
-        params.correlationToken,
-        params.error,
-      );
-      return Result.ok(undefined);
-    }
-
-    const arnResult = await this.resolveStateMachineArn();
-    if (arnResult.isErr() && this.shouldUseLocalEngine()) {
+    if (this.isLocalEngineMode()) {
       this.aslLocalEngine.handleSendTaskFailure(
         params.correlationToken,
         params.error,
@@ -193,19 +193,46 @@ export class StepFunctionsOrderWorkflowAdapter implements OrderWorkflowPort {
       );
       return Result.ok(undefined);
     } catch (err) {
-      this.logger.error(
-        `[StepFunctionsAdapter] SendTaskFailure failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return Result.err(new StepFunctionsInfraError('SendTaskFailure', err));
+      return this.handleTaskCallbackError('SendTaskFailure', err);
     }
+  }
+
+  /**
+   * TaskTimedOut / TaskDoesNotExist means the taskToken was already completed by a previous
+   * Outbox delivery or timed out and was superseded by a retry. Treated as idempotent no-op.
+   */
+  private handleTaskCallbackError(
+    operation: string,
+    err: unknown,
+  ): Result<void, DomainError> {
+    if (
+      err instanceof TaskTimedOut ||
+      err instanceof TaskDoesNotExist ||
+      (err instanceof Error &&
+        (err.name === 'TaskTimedOut' ||
+          err.name === 'TaskDoesNotExist' ||
+          err.name === 'InvalidToken'))
+    ) {
+      this.logger.warn(
+        `[StepFunctionsAdapter] ${operation}: task token already closed or expired — acknowledged as idempotent no-op.`,
+      );
+      return Result.ok(undefined);
+    }
+    this.logger.error(
+      `[StepFunctionsAdapter] ${operation} failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return Result.err(new StepFunctionsInfraError(operation, err));
   }
 
   async getWorkflowStatus(
     orderId: string,
   ): Promise<Result<WorkflowExecutionSummary, DomainError>> {
-    const localSummary = this.aslLocalEngine.getExecutionSummary(orderId);
-    if (localSummary) {
-      return Result.ok(localSummary);
+    if (this.isLocalEngineMode()) {
+      return Result.ok(
+        this.aslLocalEngine.getExecutionSummary(orderId) ?? {
+          status: 'NOT_STARTED',
+        },
+      );
     }
 
     let executionArn = this.executionArnByOrder.get(orderId);

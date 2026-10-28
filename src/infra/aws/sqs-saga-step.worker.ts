@@ -39,11 +39,18 @@ export class SqsSagaStepWorker implements OnModuleInit, OnModuleDestroy {
     private readonly aslLocalEngine: AslLocalEngineService,
   ) {}
 
+  private isLocalEngineMode(): boolean {
+    return (
+      process.env.USE_LOCAL_ASL_ENGINE === 'true' ||
+      process.env.NODE_ENV === 'test'
+    );
+  }
+
   onModuleInit(): void {
     if (process.env.DISABLE_BACKGROUND_WORKERS === 'true') {
       return;
     }
-    const intervalMs = Number(process.env.SQS_POLL_INTERVAL_MS ?? 300);
+    const intervalMs = Number(process.env.SQS_POLL_INTERVAL_MS ?? 250);
     this.timer = setInterval(() => {
       void this.pollQueueOnce();
     }, intervalMs);
@@ -84,15 +91,22 @@ export class SqsSagaStepWorker implements OnModuleInit, OnModuleDestroy {
     let processedCount = 0;
 
     try {
-      // 1. Drain any locally buffered raw SQS JSON bodies through the AWS ACL Translator (unit tests)
-      const localBodies = this.aslLocalEngine.dequeueRawSqsBodies(5);
-      for (const rawBody of localBodies) {
-        const command = this.translator.toWorkflowStepCommand(rawBody);
-        await this.executeSagaStepPort.execute(command);
-        processedCount += 1;
+      if (this.isLocalEngineMode()) {
+        // 1. Drain locally buffered raw SQS JSON bodies in test mode
+        const localBodies = this.aslLocalEngine.dequeueRawSqsBodies(5);
+        for (const rawBody of localBodies) {
+          const command = this.translator.toWorkflowStepCommand(rawBody);
+          const stepResult = await this.executeSagaStepPort.execute(command);
+          if (stepResult.isErr()) {
+            this.aslLocalEngine.requeueRawSqsBody(rawBody);
+            continue;
+          }
+          processedCount += 1;
+        }
+        return processedCount;
       }
 
-      // 2. Poll LocalStack SQS queue if reachable
+      // 2. Poll LocalStack SQS queue in live mode
       const queueUrl = await this.resolveQueueUrl();
       if (!queueUrl) {
         return processedCount;
@@ -115,7 +129,15 @@ export class SqsSagaStepWorker implements OnModuleInit, OnModuleDestroy {
           `[SqsSagaStepWorker] Received step='${command.stepName}' (orderId=${command.wrapper.payload.orderId}, idempotencyKey=${command.idempotencyKey}) from QueueUrl=${queueUrl}`,
         );
 
-        await this.executeSagaStepPort.execute(command);
+        const stepResult = await this.executeSagaStepPort.execute(command);
+        if (stepResult.isErr()) {
+          // Do NOT delete the SQS message if the database transaction failed;
+          // SQS will redeliver it after visibility timeout and the Inbox guarantees idempotency.
+          this.logger.error(
+            `[SqsSagaStepWorker] Failed to persist step='${command.stepName}' (orderId=${command.wrapper.payload.orderId}): ${stepResult.error.message} — keeping message in SQS for retry`,
+          );
+          continue;
+        }
 
         if (sqsMsg.ReceiptHandle) {
           await this.sqsClient.send(
@@ -125,7 +147,7 @@ export class SqsSagaStepWorker implements OnModuleInit, OnModuleDestroy {
             }),
           );
           this.logger.log(
-            `[SqsSagaStepWorker] Finished step='${command.stepName}' (orderId=${command.wrapper.payload.orderId}) and deleted message from SQS`,
+            `[SqsSagaStepWorker] Committed Inbox+Outbox for step='${command.stepName}' (orderId=${command.wrapper.payload.orderId}, outcome=${stepResult.value.outcome}) and deleted message from SQS`,
           );
         }
         processedCount += 1;
