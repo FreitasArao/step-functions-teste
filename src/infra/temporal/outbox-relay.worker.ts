@@ -3,20 +3,20 @@ import {
   type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
-import { OutboxRelayService } from '../../shared/messaging/outbox-relay.service.js';
+import { RelayOutboxUseCase } from '../../modules/order/application/relay-outbox.use-case.js';
 
 @Injectable()
 export class OutboxRelayWorker implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private isProcessing = false;
 
-  constructor(private readonly outboxRelayService: OutboxRelayService) {}
+  constructor(private readonly relayOutboxUseCase: RelayOutboxUseCase) {}
 
   onModuleInit(): void {
     if (process.env.DISABLE_BACKGROUND_WORKERS === 'true') {
       return;
     }
-    const intervalMs = Number(process.env.OUTBOX_POLL_INTERVAL_MS ?? 250);
+    const intervalMs = Number(process.env.OUTBOX_POLL_INTERVAL_MS ?? 200);
     this.timer = setInterval(() => {
       void this.processPendingOutbox();
     }, intervalMs);
@@ -34,7 +34,7 @@ export class OutboxRelayWorker implements OnModuleInit, OnModuleDestroy {
     }
     this.isProcessing = true;
     try {
-      return await this.outboxRelayService.executeBatch();
+      return await this.relayOutboxUseCase.executeBatch();
     } finally {
       this.isProcessing = false;
     }

@@ -1,48 +1,55 @@
 import { Injectable } from '@nestjs/common';
 import { OutboxRelayWorker } from './outbox-relay.worker.js';
 import { TemporalConnectionService } from './temporal-client.provider.js';
-import { TemporalOrderEventsWorker } from './temporal-order-events.worker.js';
 import { TemporalSagaStepWorker } from './temporal-saga-step.worker.js';
 
 @Injectable()
 export class SagaPipelineRunnerService {
   constructor(
     private readonly outboxRelay: OutboxRelayWorker,
-    private readonly orderEventsWorker: TemporalOrderEventsWorker,
     private readonly sagaStepWorker: TemporalSagaStepWorker,
     private readonly temporalConnection: TemporalConnectionService,
   ) {}
 
   /**
-   * Runs the full production pipeline deterministically:
-   * 1. Outbox Relay -> Publishes pending domain events via MessagePublisherPort
-   * 2. Temporal Order Events Worker -> Consumes 'ORDER_CREATED' and starts Temporal Workflow
-   * 3. Temporal Saga Step Worker -> Consumes Async Activity tasks (with base64 taskToken),
-   *    executes UseCase with Transactional Inbox, and calls AsyncCompletionClient.complete / fail
+   * Runs the full Transactional Outbox + Inbox pipeline deterministically:
+   * 1. Outbox Relay (`RelayOutboxUseCase`) -> Delivers PENDING outbox messages
+   *    (`ORDER_CREATED`, `WORKFLOW_STEP_COMPLETED`, `WORKFLOW_STEP_FAILED`) to `OrderWorkflowPort`
+   *    and marks them PUBLISHED only after Temporal acknowledges them.
+   * 2. Activity Execution -> Executes `ExecuteSagaStepUseCase` (Transactional Inbox + Domain UseCase +
+   *    Transactional Outbox callback in a single ACID transaction).
+   * 3. Next Outbox Relay cycle -> Delivers the `WORKFLOW_STEP_COMPLETED` / `WORKFLOW_STEP_FAILED`
+   *    outbox message via `AsyncCompletionClient.complete` / `fail`.
    */
-  async drainUntilSettled(maxCycles = 16): Promise<void> {
-    const isLiveTemporal = this.temporalConnection.isTemporalServerActive();
+  async drainUntilSettled(maxCycles = 24): Promise<void> {
+    const isLocalMode = this.temporalConnection.isLocalEngineMode();
 
     for (let i = 0; i < maxCycles; i += 1) {
       const published = await this.outboxRelay.processPendingOutbox();
-      const eventsStarted =
-        await this.orderEventsWorker.pollEventsQueueOnce();
 
-      if (isLiveTemporal && (published > 0 || eventsStarted > 0)) {
-        // Give Temporal Server a brief window to schedule the next Activity task onto the Worker
-        await new Promise((r) => setTimeout(r, 150));
-      }
+      if (isLocalMode) {
+        const stepsProcessed =
+          await this.sagaStepWorker.pollActivityQueueOnce();
+        const callbacksPublished =
+          await this.outboxRelay.processPendingOutbox();
 
-      const stepsProcessed =
-        await this.sagaStepWorker.pollActivityQueueOnce();
+        if (
+          published === 0 &&
+          stepsProcessed === 0 &&
+          callbacksPublished === 0
+        ) {
+          break;
+        }
+      } else {
+        // In live Temporal mode, the Temporal Worker executes the Activity asynchronously
+        // and writes the callback event into outbox_messages.
+        await new Promise((r) => setTimeout(r, 180));
+        const callbacksPublished =
+          await this.outboxRelay.processPendingOutbox();
 
-      if (isLiveTemporal && stepsProcessed > 0) {
-        await new Promise((r) => setTimeout(r, 150));
-        continue;
-      }
-
-      if (published === 0 && eventsStarted === 0 && stepsProcessed === 0) {
-        break;
+        if (published === 0 && callbacksPublished === 0 && i >= 3) {
+          break;
+        }
       }
     }
   }

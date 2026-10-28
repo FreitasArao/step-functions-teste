@@ -3,8 +3,15 @@ import type { MessageWrapper } from './message-wrapper.js';
 
 /**
  * Cloud-agnostic domain outbox event types.
+ * - ORDER_CREATED: requests the orchestrator to start the Order Saga.
+ * - WORKFLOW_STEP_COMPLETED / WORKFLOW_STEP_FAILED: callback to the orchestrator carrying the
+ *   step outcome, persisted in the SAME transaction as the Inbox record and the domain state change.
  */
-export type OutboxEventType = 'ORDER_CREATED' | (string & {});
+export type OutboxEventType =
+  | 'ORDER_CREATED'
+  | 'WORKFLOW_STEP_COMPLETED'
+  | 'WORKFLOW_STEP_FAILED'
+  | (string & {});
 
 export type OutboxStatus = 'PENDING' | 'PUBLISHED' | 'FAILED';
 

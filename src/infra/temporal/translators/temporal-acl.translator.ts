@@ -61,6 +61,10 @@ export interface TemporalActivityEnvelope {
 export class TemporalAclTranslator {
   /**
    * Translates an agnostic MessageWrapper<StartSagaPayload> into Temporal WorkflowClient.start options.
+   *
+   * The deterministic workflowId + REJECT_DUPLICATE make the start IDEMPOTENT for at-least-once
+   * Outbox delivery: a redelivered ORDER_CREATED never starts a second saga, not even after the
+   * first execution has already closed (the default ALLOW_DUPLICATE policy would allow it).
    */
   toStartWorkflowInput(
     taskQueue: string,
@@ -68,12 +72,14 @@ export class TemporalAclTranslator {
   ): {
     workflowId: string;
     taskQueue: string;
+    workflowIdReusePolicy: 'REJECT_DUPLICATE';
     args: [TemporalWorkflowInput];
     memo: Record<string, unknown>;
   } {
     return {
       workflowId: `order-saga-${wrapper.payload.orderId}`,
       taskQueue,
+      workflowIdReusePolicy: 'REJECT_DUPLICATE',
       args: [
         {
           metadata: wrapper.metadata,
@@ -205,11 +211,8 @@ export class TemporalAclTranslator {
     if (statusName === 'COMPLETED') {
       status = 'COMPLETED';
     } else if (statusName === 'FAILED') {
-      status =
-        failureMetadata?.code === 'ORDER_SAGA_ROLLED_BACK' ||
-        failureMetadata?.code === 'ApplicationFailure'
-          ? 'ROLLED_BACK'
-          : 'ROLLED_BACK';
+      // The saga workflow only fails after running all compensations (ORDER_SAGA_ROLLED_BACK)
+      status = 'ROLLED_BACK';
     } else if (
       statusName === 'TIMED_OUT' ||
       statusName === 'TERMINATED' ||

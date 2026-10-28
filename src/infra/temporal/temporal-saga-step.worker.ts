@@ -13,13 +13,17 @@ import {
 } from '../../modules/order/application/ports/saga-step.inbound-port.js';
 import type { DomainError } from '../../shared/core/domain-error.js';
 import type { Result } from '../../shared/core/result.js';
+import { TemporalConnectionService } from './temporal-client.provider.js';
 import { TemporalLocalEngineService } from './temporal-local-engine.service.js';
-import { TemporalAclTranslator } from './translators/temporal-acl.translator.js';
+import { TemporalSagaStepActivityHandler } from './temporal-saga-step-activity.handler.js';
 
 /**
- * Driving Worker that drains Temporal Activity tasks (carrying Temporal's base64 taskToken),
- * translates them via TemporalAclTranslator into the cloud-agnostic WorkflowStepCommand,
- * and invokes ExecuteSagaStepInboundPort (which runs Transactional Inbox + Domain UseCase + AsyncCompletionClient callback).
+ * Driving Worker used ONLY in local emulator test mode (`NODE_ENV=test` / `USE_LOCAL_TEMPORAL_ENGINE=true`)
+ * to drain activity tasks from `TemporalLocalEngineService` and invoke `TemporalSagaStepActivityHandler`.
+ *
+ * When connected to a real Temporal Server, the official `@temporalio/worker` invokes
+ * `TemporalSagaStepActivityHandler.handle(envelope)` directly inside the Activity (Temporal Server
+ * itself is the durable queue, with zero in-memory intermediate buffer).
  */
 @Injectable()
 export class TemporalSagaStepWorker implements OnModuleInit, OnModuleDestroy {
@@ -28,14 +32,18 @@ export class TemporalSagaStepWorker implements OnModuleInit, OnModuleDestroy {
   private isPolling = false;
 
   constructor(
-    private readonly translator: TemporalAclTranslator,
+    private readonly activityHandler: TemporalSagaStepActivityHandler,
     @Inject(EXECUTE_SAGA_STEP_INBOUND_PORT)
     private readonly executeSagaStepPort: ExecuteSagaStepInboundPort,
     private readonly localEngine: TemporalLocalEngineService,
+    private readonly temporalConnection: TemporalConnectionService,
   ) {}
 
   onModuleInit(): void {
-    if (process.env.DISABLE_BACKGROUND_WORKERS === 'true') {
+    if (
+      process.env.DISABLE_BACKGROUND_WORKERS === 'true' ||
+      !this.temporalConnection.isLocalEngineMode()
+    ) {
       return;
     }
     const intervalMs = Number(process.env.TEMPORAL_STEP_POLL_INTERVAL_MS ?? 200);
@@ -51,7 +59,7 @@ export class TemporalSagaStepWorker implements OnModuleInit, OnModuleDestroy {
   }
 
   async pollActivityQueueOnce(): Promise<number> {
-    if (this.isPolling) {
+    if (!this.temporalConnection.isLocalEngineMode() || this.isPolling) {
       return 0;
     }
     this.isPolling = true;
@@ -60,17 +68,15 @@ export class TemporalSagaStepWorker implements OnModuleInit, OnModuleDestroy {
     try {
       const rawEnvelopes = this.localEngine.dequeueRawActivityEnvelopes(5);
       for (const rawJson of rawEnvelopes) {
-        const command = this.translator.toWorkflowStepCommand(rawJson);
-        this.logger.log(
-          `[TemporalSagaStepWorker] Executing activity step='${command.stepName}' (orderId=${command.wrapper.payload.orderId}, idempotencyKey=${command.idempotencyKey})`,
-        );
-
-        await this.executeSagaStepPort.execute(command);
-
-        this.logger.log(
-          `[TemporalSagaStepWorker] Completed activity step='${command.stepName}' (orderId=${command.wrapper.payload.orderId})`,
-        );
-        processedCount += 1;
+        try {
+          await this.activityHandler.handle(rawJson);
+          processedCount += 1;
+        } catch (err) {
+          this.logger.warn(
+            `[TemporalSagaStepWorker] Activity execution failed (${err instanceof Error ? err.message : String(err)}) — requeueing for retry.`,
+          );
+          this.localEngine.requeueActivityEnvelope(rawJson);
+        }
       }
 
       return processedCount;

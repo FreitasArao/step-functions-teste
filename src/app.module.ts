@@ -16,9 +16,8 @@ import { OutboxRelayWorker } from './infra/temporal/outbox-relay.worker.js';
 import { SagaPipelineRunnerService } from './infra/temporal/saga-pipeline-runner.service.js';
 import { TemporalConnectionService } from './infra/temporal/temporal-client.provider.js';
 import { TemporalLocalEngineService } from './infra/temporal/temporal-local-engine.service.js';
-import { TemporalEventPublisherAdapter } from './infra/temporal/temporal-message-publisher.adapter.js';
-import { TemporalOrderEventsWorker } from './infra/temporal/temporal-order-events.worker.js';
 import { TemporalOrderWorkflowAdapter } from './infra/temporal/temporal-order-workflow.adapter.js';
+import { TemporalSagaStepActivityHandler } from './infra/temporal/temporal-saga-step-activity.handler.js';
 import { TemporalSagaStepWorker } from './infra/temporal/temporal-saga-step.worker.js';
 import { TemporalAclTranslator } from './infra/temporal/translators/temporal-acl.translator.js';
 import { CancelOrderUseCase } from './modules/order/application/cancel-order.use-case.js';
@@ -28,6 +27,7 @@ import { ExecuteSagaStepUseCase } from './modules/order/application/execute-saga
 import { GetOrderDiagnosticsUseCase } from './modules/order/application/get-order-diagnostics.use-case.js';
 import { ORDER_WORKFLOW_PORT } from './modules/order/application/ports/order-workflow.outbound-port.js';
 import { EXECUTE_SAGA_STEP_INBOUND_PORT } from './modules/order/application/ports/saga-step.inbound-port.js';
+import { RelayOutboxUseCase } from './modules/order/application/relay-outbox.use-case.js';
 import { ORDER_REPOSITORY_PORT } from './modules/order/domain/order.repository.port.js';
 import { OrderController } from './modules/order/infra/http/order.controller.js';
 import { InMemoryOrderRepository } from './modules/order/infra/in-memory-order.repository.js';
@@ -51,8 +51,6 @@ import {
   InMemoryOutboxRepository,
 } from './shared/messaging/in-memory-messaging.store.js';
 import { INBOX_REPOSITORY_PORT } from './shared/messaging/inbox.port.js';
-import { MESSAGE_PUBLISHER_PORT } from './shared/messaging/message-publisher.port.js';
-import { OutboxRelayService } from './shared/messaging/outbox-relay.service.js';
 import { OUTBOX_REPOSITORY_PORT } from './shared/messaging/outbox.port.js';
 import { UNIT_OF_WORK_PORT } from './shared/messaging/unit-of-work.port.js';
 
@@ -125,15 +123,13 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       useExisting: PostgresShipmentRepository,
     },
 
-    // Generic Messaging Services (100% Agnostic Outbox Relay)
-    OutboxRelayService,
-
     // Domain & Application Use Cases (100% Agnostic of Orchestrator / Queue)
     CreateOrderUseCase,
     ConfirmOrderUseCase,
     CancelOrderUseCase,
     GetOrderDiagnosticsUseCase,
     ExecuteSagaStepUseCase,
+    RelayOutboxUseCase,
     {
       provide: EXECUTE_SAGA_STEP_INBOUND_PORT,
       useExisting: ExecuteSagaStepUseCase,
@@ -147,19 +143,14 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     // Temporal.io Translation Layer (ACL) + Temporal Adapters + Workers
     TemporalAclTranslator,
     TemporalLocalEngineService,
+    TemporalSagaStepActivityHandler,
     TemporalConnectionService,
-    TemporalEventPublisherAdapter,
-    {
-      provide: MESSAGE_PUBLISHER_PORT,
-      useExisting: TemporalEventPublisherAdapter,
-    },
     TemporalOrderWorkflowAdapter,
     {
       provide: ORDER_WORKFLOW_PORT,
       useExisting: TemporalOrderWorkflowAdapter,
     },
     OutboxRelayWorker,
-    TemporalOrderEventsWorker,
     TemporalSagaStepWorker,
     SagaPipelineRunnerService,
   ],

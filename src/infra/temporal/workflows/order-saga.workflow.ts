@@ -29,11 +29,22 @@ export interface TemporalStepActivityInput {
   };
 }
 
+/**
+ * Retry policy:
+ * - Business failures (PAYMENT_DECLINED, ...) arrive via AsyncCompletionClient.fail as
+ *   ApplicationFailure.nonRetryable -> NOT retried -> trigger the compensations.
+ * - Infrastructure failures (worker crash, DB down, lost callback -> startToClose timeout) ARE
+ *   retried indefinitely with backoff. Each attempt gets a new taskToken; the Transactional Inbox
+ *   guarantees the domain runs only once and replays the stored outcome to the new token.
+ *   Treating a timeout as a business failure would compensate a step whose effect may already be
+ *   committed (e.g. stock reserved but never released).
+ */
 const { dispatchSagaStepActivity } = proxyActivities<OrderSagaActivities>({
   startToCloseTimeout: '30 seconds',
   retry: {
-    // Domain/business errors are deterministic and handled by Saga compensations
-    maximumAttempts: 1,
+    initialInterval: '1 second',
+    backoffCoefficient: 2,
+    maximumInterval: '30 seconds',
   },
 });
 

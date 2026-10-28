@@ -7,17 +7,19 @@ export interface OrderSagaActivities {
 }
 
 /**
- * Factory that creates the Temporal Activity implementation using Async Activity Completion.
+ * Factory that creates the Temporal Activity implementation using Async Activity Completion
+ * combined with the Transactional Inbox + Outbox.
  *
  * When Temporal invokes `dispatchSagaStepActivity`:
  * 1. Extracts `activityInfo().taskToken` (Uint8Array) and encodes it as base64 (`correlationToken`).
- * 2. Enqueues the `TemporalActivityEnvelope` for the `TemporalSagaStepWorker` to translate via
- *    `TemporalAclTranslator` and execute `ExecuteSagaStepInboundPort` (Transactional Inbox + Domain UseCase).
- * 3. Throws `CompleteAsyncError` so Temporal pauses the Activity waiting for
- *    `TemporalOrderWorkflowAdapter.completeWorkflowStep` / `failWorkflowStep` (`AsyncCompletionClient`)!
+ *    Each retry ATTEMPT receives a NEW taskToken.
+ * 2. Runs the step synchronously through `handleStep` (Inbox -> Domain -> Outbox callback in ONE transaction).
+ *    If it throws (infra failure), the activity fails and Temporal retries it.
+ * 3. Throws `CompleteAsyncError`: the result is delivered later by the Outbox Relay through
+ *    `AsyncCompletionClient.complete / fail` (TemporalOrderWorkflowAdapter).
  */
 export function createOrderSagaActivities(
-  enqueueActivityEnvelope: (envelope: TemporalActivityEnvelope) => void,
+  handleStep: (envelope: TemporalActivityEnvelope) => Promise<unknown>,
 ): OrderSagaActivities {
   return {
     async dispatchSagaStepActivity(
@@ -40,7 +42,7 @@ export function createOrderSagaActivities(
         payload: input.payload,
       };
 
-      enqueueActivityEnvelope(envelope);
+      await handleStep(envelope);
 
       throw new CompleteAsyncError();
     },

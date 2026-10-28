@@ -43,6 +43,7 @@ describe('Domain Logic, Use Cases (Result Pattern), Temporal.io Adapter & Databa
 
   beforeAll(async () => {
     process.env.DISABLE_BACKGROUND_WORKERS = 'true';
+    process.env.USE_LOCAL_TEMPORAL_ENGINE = 'true';
 
     moduleRef = await Test.createTestingModule({
       imports: [AppModule],
@@ -239,6 +240,22 @@ describe('Domain Logic, Use Cases (Result Pattern), Temporal.io Adapter & Databa
         'CREATE_SHIPMENT',
         'CONFIRM_ORDER',
       ]);
+      expect(
+        diagResult.value.transactionalMessaging.outboxEvents.map(
+          (e) => e.eventType,
+        ),
+      ).toEqual([
+        'ORDER_CREATED',
+        'WORKFLOW_STEP_COMPLETED',
+        'WORKFLOW_STEP_COMPLETED',
+        'WORKFLOW_STEP_COMPLETED',
+        'WORKFLOW_STEP_COMPLETED',
+      ]);
+      expect(
+        diagResult.value.transactionalMessaging.outboxEvents.every(
+          (e) => e.status === 'PUBLISHED',
+        ),
+      ).toBe(true);
       expect(diagResult.value.distributedTracing.traceIds).toContain(
         '1000000000000000001',
       );
@@ -375,15 +392,39 @@ describe('Domain Logic, Use Cases (Result Pattern), Temporal.io Adapter & Databa
         temporalTranslator.toWorkflowStepCommand(rawTemporalEnvelope);
       const firstCall = await executeSagaStepUseCase.execute(agnosticCommand);
       expect(firstCall.isOk()).toBe(true);
+      if (firstCall.isOk()) {
+        expect(firstCall.value.deduplicated).toBe(false);
+        expect(firstCall.value.outcome).toBe('OK');
+      }
 
-      const secondCall = await executeSagaStepUseCase.execute(agnosticCommand);
+      // Simulate Temporal Activity Retry (same idempotencyKey, NEW taskToken)
+      const retryEnvelope = JSON.stringify({
+        ...JSON.parse(rawTemporalEnvelope),
+        taskToken: Buffer.from(
+          'temporal_local_token:ord_idempotent_test:RESERVE_STOCK:dup2_new_token',
+          'utf8',
+        ).toString('base64'),
+      });
+      const retryCommand =
+        temporalTranslator.toWorkflowStepCommand(retryEnvelope);
+      const secondCall = await executeSagaStepUseCase.execute(retryCommand);
       expect(secondCall.isOk()).toBe(true);
       if (secondCall.isOk()) {
         expect(secondCall.value.deduplicated).toBe(true);
+        expect(secondCall.value.outcome).toBe('OK');
       }
 
       const skuItem = await stockRepository.findBySku('SKU-100');
       expect(skuItem?.availableQuantity).toBe(7);
+
+      const dump = await orderController.getDatabaseDump();
+      const outboxForOrder = dump.tables.outbox_messages.filter(
+        (m) => m.orderId === 'ord_idempotent_test',
+      );
+      expect(outboxForOrder).toHaveLength(2);
+      expect(outboxForOrder[0]?.correlationToken).not.toBe(
+        outboxForOrder[1]?.correlationToken,
+      );
     });
   });
 });

@@ -1,4 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
+import {
+  ActivityNotFoundError,
+  WorkflowExecutionAlreadyStartedError,
+} from '@temporalio/client';
 import type {
   OrderWorkflowPort,
   StartSagaPayload,
@@ -27,19 +31,16 @@ export class TemporalInfraError implements DomainError {
 }
 
 /**
- * Infrastructure Adapter implementing the agnostic OrderWorkflowPort using Temporal.io:
- * - WorkflowClient.start(orderSagaWorkflow)
- * - AsyncCompletionClient.complete(taskToken, output)
- * - AsyncCompletionClient.fail(taskToken, ApplicationFailure)
- * - WorkflowHandle.describe()
+ * Infrastructure Adapter implementing the agnostic OrderWorkflowPort using Temporal.io.
+ * Called exclusively by the Outbox Relay, therefore every operation is an IDEMPOTENT RECEIVER:
+ * - startOrderWorkflow   -> deterministic workflowId + REJECT_DUPLICATE; "already started" == success
+ * - completeWorkflowStep -> AsyncCompletionClient.complete; unknown/stale token == no-op success
+ * - failWorkflowStep     -> AsyncCompletionClient.fail;     unknown/stale token == no-op success
+ * Any other failure returns Result.err so the Outbox row stays PENDING and is retried.
  */
 @Injectable()
 export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
   private readonly logger = new Logger(TemporalOrderWorkflowAdapter.name);
-  private readonly lastFailureByOrder = new Map<
-    string,
-    { code: string; reason: string }
-  >();
 
   constructor(
     private readonly temporalConnection: TemporalConnectionService,
@@ -50,39 +51,46 @@ export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
   async startOrderWorkflow(
     wrapper: MessageWrapper<StartSagaPayload>,
   ): Promise<Result<{ workflowInstanceId: string }, DomainError>> {
-    const workflowClient = this.temporalConnection.getWorkflowClient();
-
-    if (this.temporalConnection.isTemporalServerActive() && workflowClient) {
-      try {
-        const startInput = this.translator.toStartWorkflowInput(
-          TEMPORAL_ORDER_SAGA_TASK_QUEUE,
-          wrapper,
-        );
-        const handle = await workflowClient.start(orderSagaWorkflow, startInput);
-        const workflowInstanceId = `${handle.workflowId}:${handle.firstExecutionRunId}`;
-        this.logger.log(
-          `[TemporalAdapter] Workflow started -> workflowId=${handle.workflowId}, runId=${handle.firstExecutionRunId}`,
-        );
-        return Result.ok({ workflowInstanceId });
-      } catch (err) {
-        this.logger.warn(
-          `[TemporalAdapter] Live Temporal start failed (${err instanceof Error ? err.message : String(err)}), falling back to local engine.`,
-        );
-      }
+    if (this.temporalConnection.isLocalEngineMode()) {
+      return Result.ok(this.localEngine.startLocalWorkflowExecution(wrapper));
     }
 
-    const fallbackExec = this.localEngine.startLocalWorkflowExecution(wrapper);
-    this.logger.log(
-      `[TemporalAdapter] Started workflow execution -> workflowInstanceId=${fallbackExec.workflowInstanceId}`,
+    const workflowClient = await this.temporalConnection.getWorkflowClient();
+    if (!workflowClient) {
+      return Result.err(
+        new TemporalInfraError('WorkflowClient.start', 'Temporal Server not connected'),
+      );
+    }
+
+    const startInput = this.translator.toStartWorkflowInput(
+      TEMPORAL_ORDER_SAGA_TASK_QUEUE,
+      wrapper,
     );
-    return Result.ok(fallbackExec);
+
+    try {
+      const handle = await workflowClient.start(orderSagaWorkflow, startInput);
+      this.logger.log(
+        `[TemporalAdapter] Workflow started -> workflowId=${handle.workflowId}, runId=${handle.firstExecutionRunId}`,
+      );
+      return Result.ok({
+        workflowInstanceId: `${handle.workflowId}:${handle.firstExecutionRunId}`,
+      });
+    } catch (err) {
+      if (err instanceof WorkflowExecutionAlreadyStartedError) {
+        this.logger.warn(
+          `[TemporalAdapter] Workflow '${startInput.workflowId}' already started — duplicate Outbox delivery acknowledged (idempotent).`,
+        );
+        return Result.ok({ workflowInstanceId: startInput.workflowId });
+      }
+      return Result.err(new TemporalInfraError('WorkflowClient.start', err));
+    }
   }
 
   async completeWorkflowStep(params: {
     correlationToken: string;
     output: unknown;
   }): Promise<Result<void, DomainError>> {
-    if (this.localEngine.isLocalTaskToken(params.correlationToken)) {
+    if (this.temporalConnection.isLocalEngineMode()) {
       this.localEngine.handleAsyncActivityComplete(
         params.correlationToken,
         params.output,
@@ -90,13 +98,14 @@ export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
       return Result.ok(undefined);
     }
 
-    const asyncClient = this.temporalConnection.getAsyncCompletionClient();
-    if (!asyncClient || !this.temporalConnection.isTemporalServerActive()) {
-      this.localEngine.handleAsyncActivityComplete(
-        params.correlationToken,
-        params.output,
+    const asyncClient = await this.temporalConnection.getAsyncCompletionClient();
+    if (!asyncClient) {
+      return Result.err(
+        new TemporalInfraError(
+          'AsyncCompletionClient.complete',
+          'Temporal Server not connected',
+        ),
       );
-      return Result.ok(undefined);
     }
 
     try {
@@ -104,16 +113,11 @@ export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
         this.translator.toAsyncActivityCompleteInput(params);
       await asyncClient.complete(taskToken, result);
       this.logger.log(
-        `[TemporalAdapter] AsyncCompletionClient.complete sent to Temporal (token=${params.correlationToken.slice(0, 16)}...)`,
+        `[TemporalAdapter] AsyncCompletionClient.complete sent (token=${params.correlationToken.slice(0, 16)}...)`,
       );
       return Result.ok(undefined);
     } catch (err) {
-      this.logger.error(
-        `[TemporalAdapter] AsyncCompletionClient.complete failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return Result.err(
-        new TemporalInfraError('AsyncCompletionClient.complete', err),
-      );
+      return this.handleCompletionError('AsyncCompletionClient.complete', err);
     }
   }
 
@@ -121,7 +125,7 @@ export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
     correlationToken: string;
     error: DomainError;
   }): Promise<Result<void, DomainError>> {
-    if (this.localEngine.isLocalTaskToken(params.correlationToken)) {
+    if (this.temporalConnection.isLocalEngineMode()) {
       this.localEngine.handleAsyncActivityFailure(
         params.correlationToken,
         params.error,
@@ -129,13 +133,14 @@ export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
       return Result.ok(undefined);
     }
 
-    const asyncClient = this.temporalConnection.getAsyncCompletionClient();
-    if (!asyncClient || !this.temporalConnection.isTemporalServerActive()) {
-      this.localEngine.handleAsyncActivityFailure(
-        params.correlationToken,
-        params.error,
+    const asyncClient = await this.temporalConnection.getAsyncCompletionClient();
+    if (!asyncClient) {
+      return Result.err(
+        new TemporalInfraError(
+          'AsyncCompletionClient.fail',
+          'Temporal Server not connected',
+        ),
       );
-      return Result.ok(undefined);
     }
 
     try {
@@ -143,51 +148,66 @@ export class TemporalOrderWorkflowAdapter implements OrderWorkflowPort {
         this.translator.toAsyncActivityFailureInput(params);
       await asyncClient.fail(taskToken, failure);
       this.logger.warn(
-        `[TemporalAdapter] AsyncCompletionClient.fail sent to Temporal (error=${params.error.code}, token=${params.correlationToken.slice(0, 16)}...)`,
+        `[TemporalAdapter] AsyncCompletionClient.fail sent (error=${params.error.code}, token=${params.correlationToken.slice(0, 16)}...)`,
       );
       return Result.ok(undefined);
     } catch (err) {
-      this.logger.error(
-        `[TemporalAdapter] AsyncCompletionClient.fail failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return Result.err(
-        new TemporalInfraError('AsyncCompletionClient.fail', err),
-      );
+      return this.handleCompletionError('AsyncCompletionClient.fail', err);
     }
+  }
+
+  /**
+   * ActivityNotFoundError means the token belongs to an attempt that is already closed
+   * (completed by a previous delivery, or timed out and superseded by a retry whose Inbox
+   * replay produced a NEW outbox message with the new token). Either way: idempotent no-op.
+   */
+  private handleCompletionError(
+    operation: string,
+    err: unknown,
+  ): Result<void, DomainError> {
+    if (err instanceof ActivityNotFoundError) {
+      this.logger.warn(
+        `[TemporalAdapter] ${operation}: activity attempt already closed (stale/duplicate token) — acknowledged as idempotent no-op.`,
+      );
+      return Result.ok(undefined);
+    }
+    this.logger.error(
+      `[TemporalAdapter] ${operation} failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return Result.err(new TemporalInfraError(operation, err));
   }
 
   async getWorkflowStatus(
     orderId: string,
   ): Promise<Result<WorkflowExecutionSummary, DomainError>> {
-    const localSummary = this.localEngine.getExecutionSummary(orderId);
-    if (localSummary) {
-      return Result.ok(localSummary);
+    if (this.temporalConnection.isLocalEngineMode()) {
+      return Result.ok(
+        this.localEngine.getExecutionSummary(orderId) ?? { status: 'NOT_STARTED' },
+      );
     }
 
-    const workflowClient = this.temporalConnection.getWorkflowClient();
-    if (!workflowClient || !this.temporalConnection.isTemporalServerActive()) {
+    const workflowClient = await this.temporalConnection.getWorkflowClient();
+    if (!workflowClient) {
       return Result.ok({ status: 'NOT_STARTED' });
     }
 
     const workflowId = `order-saga-${orderId}`;
     try {
-      const handle = workflowClient.getHandle(workflowId);
-      const description = await handle.describe();
-      const failureMeta = this.lastFailureByOrder.get(orderId) ?? {
-        code: 'ORDER_SAGA_ROLLED_BACK',
-        reason: 'Order saga failed and all compensations were executed.',
-      };
+      const description = await workflowClient.getHandle(workflowId).describe();
       return Result.ok(
         this.translator.toWorkflowExecutionSummary(
           workflowId,
           description,
-          description.status.name === 'FAILED' ? failureMeta : undefined,
+          description.status.name === 'FAILED'
+            ? {
+                code: 'ORDER_SAGA_ROLLED_BACK',
+                reason: 'Order saga failed and all compensations were executed.',
+              }
+            : undefined,
         ),
       );
     } catch {
-      return Result.ok({
-        status: 'NOT_STARTED',
-      });
+      return Result.ok({ status: 'NOT_STARTED' });
     }
   }
 }

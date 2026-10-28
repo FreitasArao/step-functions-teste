@@ -28,8 +28,12 @@ interface ActiveTemporalExecution {
 }
 
 /**
- * Buffers incoming Temporal Activity envelopes (both from live Temporal Worker activities
- * and from the in-process Temporal Workflow emulator used during unit tests when Temporal Server is offline).
+ * In-process Temporal Workflow EMULATOR — explicit test double, enabled only when
+ * NODE_ENV=test or USE_LOCAL_TEMPORAL_ENGINE=true (see isLocalTemporalEngineMode).
+ * It mirrors orderSagaWorkflow (forward steps + LIFO compensations) and the Async Activity
+ * Completion contract (base64 taskToken per step) so the full Outbox -> Activity -> Inbox ->
+ * Outbox -> Callback cycle can be tested without a Temporal Server.
+ * It is NEVER used as a fallback when a real Temporal Server is unavailable.
  */
 @Injectable()
 export class TemporalLocalEngineService {
@@ -43,14 +47,16 @@ export class TemporalLocalEngineService {
   >();
   private readonly activityEnvelopeBuffer: string[] = [];
 
-  enqueueLiveActivityEnvelope(envelope: TemporalActivityEnvelope): void {
-    this.activityEnvelopeBuffer.push(JSON.stringify(envelope));
-  }
-
   startLocalWorkflowExecution(wrapper: MessageWrapper<StartSagaPayload>): {
     workflowInstanceId: string;
   } {
     const orderId = wrapper.payload.orderId;
+    const existing = this.executionsByOrder.get(orderId);
+    if (existing) {
+      // Mirrors REJECT_DUPLICATE: a redelivered ORDER_CREATED does not start a second saga
+      return { workflowInstanceId: `${existing.workflowId}:${existing.runId}` };
+    }
+
     const workflowId = `order-saga-${orderId}`;
     const runId = randomUUID();
 
@@ -94,20 +100,13 @@ export class TemporalLocalEngineService {
     this.activityEnvelopeBuffer.push(JSON.stringify(rawEnvelope));
   }
 
-  isLocalTaskToken(correlationToken: string): boolean {
-    if (this.executionsByToken.has(correlationToken)) {
-      return true;
-    }
-    try {
-      const decoded = Buffer.from(correlationToken, 'base64').toString('utf8');
-      return decoded.startsWith('temporal_local_token:');
-    } catch {
-      return false;
-    }
-  }
-
   dequeueRawActivityEnvelopes(max = 5): string[] {
     return this.activityEnvelopeBuffer.splice(0, max);
+  }
+
+  /** Emulates a Temporal activity retry (same step, NEW taskToken). */
+  requeueActivityEnvelope(rawEnvelope: string): void {
+    this.activityEnvelopeBuffer.push(rawEnvelope);
   }
 
   handleAsyncActivityComplete(correlationToken: string, output: unknown): void {
