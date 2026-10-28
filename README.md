@@ -6,14 +6,14 @@ Laboratório prático (**build to learn**) demonstrando como orquestrar uma **Sa
 - **Camada de Tradução / Anti-Corruption Layer AWS (`AwsStepFunctionsTranslator`)** isolando `taskToken`, `executionArn` e formato de erro ASL fora do domínio
 - **Result Pattern (`Result<T, E>`)** em todo o domínio e casos de uso (**zero exceptions** para regras de negócio)
 - **AWS SQS (`sendMessage.waitForTaskToken`)** para execução assíncrona dos steps
-- **Transactional Outbox & Transactional Inbox** no PostgreSQL 16 (garantia de entrega + idempotência contra entregas duplicadas do SQS)
+- **Transactional Outbox (Eventos de Domínio) & Transactional Inbox (Comandos de Step + Callback)** no PostgreSQL 16 (garantia de entrega + idempotência contra entregas duplicadas do SQS)
 - **`MessageWrapper<T>` + Datadog `dd-trace`** para propagação de **Trace Distribuído** (`x-datadog-trace-id`, `x-datadog-parent-id`, `traceparent`) através de banco (Outbox/Inbox), Step Functions e SQS
 
 ---
 
 ## Como o Fluxo Funciona ao Bater em `POST /orders`?
 
-**Sim!** Uma vez com o ambiente de pé (na branch `master`, ou após você completar os `TODO`s na branch `practice/saga`), **basta fazer um `POST /orders`** e todo o ciclo abaixo acontece automaticamente em background:
+Uma vez com o ambiente de pé, **basta fazer um `POST /orders`** e todo o ciclo abaixo acontece automaticamente em background:
 
 ```text
 1. [HTTP POST /orders]
@@ -21,13 +21,13 @@ Laboratório prático (**build to learn**) demonstrando como orquestrar uma **Sa
      ▼
 2. [CreateOrderUseCase + PostgresUnitOfWork]
      ├── Salva Order (status = 'PENDING') na tabela `orders`
-     └── Salva evento 'ORDER_WORKFLOW_REQUESTED' (status = 'PENDING') na tabela `outbox_messages`
+     └── Salva evento de domínio 'ORDER_CREATED' (status = 'PENDING') na tabela `outbox_messages`
      │
-     ▼ (Polling automático a cada 250ms pelo OutboxRelayWorker -> RelayOutboxUseCase)
-3. [StepFunctionsOrderWorkflowAdapter + AwsStepFunctionsTranslator]
-     ├── Traduz MessageWrapper para StartExecutionCommand do AWS Step Functions
-     ├── Inicia a State Machine no MiniStack (usando orderId como nome da execução)
-     └── Marca o registro da Outbox como 'PUBLISHED'
+     ▼ (Polling automático a cada 250ms pelo OutboxRelayWorker -> OutboxRelayService)
+3. [SqsMessagePublisherAdapter -> SqsOrderEventsWorker -> StepFunctionsOrderWorkflowAdapter]
+     ├── OutboxRelayService (com `FOR UPDATE SKIP LOCKED`) publica 'ORDER_CREATED' na fila SQS `order-events-queue` e marca a Outbox como 'PUBLISHED'
+     ├── SqsOrderEventsWorker consome 'ORDER_CREATED' da fila `order-events-queue`
+     └── Traduz MessageWrapper para StartExecutionCommand e inicia a State Machine no MiniStack
      │
      ▼
 4. [MiniStack Step Functions -> MiniStack SQS]
@@ -35,25 +35,18 @@ Laboratório prático (**build to learn**) demonstrando como orquestrar uma **Sa
      ├── Publica mensagem JSON na fila SQS `order-saga-tasks-queue` com `$$.Task.Token`
      └── Pausa a execução esperando callback (.waitForTaskToken)
      │
-     ▼ (Polling automático a cada 300ms pelo SqsSagaStepWorker)
+     ▼ (Polling automático a cada 250ms pelo SqsSagaStepWorker)
 5. [AwsStepFunctionsTranslator -> ExecuteSagaStepUseCase]
      ├── Traduz o JSON da AWS (taskToken) para `WorkflowStepCommand` agnóstico (correlationToken)
      ├── Abre transação ACID no Postgres (`PostgresUnitOfWork`):
      │     1. Verifica idempotência na tabela `inbox_messages` (`orderId:stepName`)
      │     2. Executa o Use Case de Domínio puro (`Result<T, DomainError>`)
-     │     3. Salva na `inbox_messages` (`outcome = 'OK'` ou `'ERR'`)
-     │     4. Salva na `outbox_messages` (`WORKFLOW_STEP_COMPLETED` ou `WORKFLOW_STEP_FAILED`)
-     └── Deleta a mensagem da fila SQS
-     │
-     ▼ (Polling automático pelo OutboxRelayWorker)
-6. [Callback para o Step Functions]
-     ├── Se 'WORKFLOW_STEP_COMPLETED' -> envia `SendTaskSuccessCommand` -> avança para o próximo Step!
-     └── Se 'WORKFLOW_STEP_FAILED'    -> envia `SendTaskFailureCommand` -> aciona o `Catch` (Rollback em Cascata)!
+     │     3. Salva na `inbox_messages` (`outcome = 'OK'` ou `'ERR'` + `response_payload`)
+     │     (Zero escrita na Outbox — a Outbox é exclusiva para eventos de domínio!)
+     ├── Envia o callback direto ao Step Functions (`SendTaskSuccessCommand` ou `SendTaskFailureCommand`):
+     │     - Se falhar na rede, retorna erro e NÃO deleta a mensagem do SQS; na reentrega, o Inbox faz deduplicação (`deduplicated = true`) e reenvia o callback a partir do `response_payload` salvo!
+     └── Deleta a mensagem da fila SQS (`DeleteMessageCommand`)
 ```
-
-> **Atenção sobre as Branches:**
-> - **Branch `master`:** Possui toda a implementação pronta e funcionando ponta a ponta.
-> - **Branch `practice/saga`:** Possui o Banco de Dados (Postgres), Entidades de Domínio, Repositórios e Use Cases de Domínio prontos, deixando os **6 arquivos da Saga/AWS com `TODO (Prática)`** para você implementar!
 
 ---
 
@@ -69,7 +62,7 @@ Verifique se os 2 containers estão rodando (`step-function-postgres` na porta `
 docker compose ps
 ```
 
-### Passo 1.2 — Criar a Fila SQS e a State Machine no MiniStack via Terraform
+### Passo 1.2 — Criar as Filas SQS e a State Machine no MiniStack via Terraform
 ```bash
 cd infra
 terraform init
@@ -77,6 +70,7 @@ terraform apply -auto-approve
 cd ..
 ```
 Ao finalizar, o Terraform exibirá os outputs:
+- `sqs_order_events_queue_url` (`http://localhost:4566/000000000000/order-events-queue`)
 - `sqs_queue_url` (`http://localhost:4566/000000000000/order-saga-tasks-queue`)
 - `state_machine_arn` (`arn:aws:states:us-east-1:000000000000:stateMachine:order-saga-state-machine`)
 
@@ -84,25 +78,18 @@ Ao finalizar, o Terraform exibirá os outputs:
 ```bash
 bun run start:dev
 ```
-A aplicação subirá em `http://localhost:3000`, conectará automaticamente ao PostgreSQL (`order_saga_db`) e iniciará os workers de background (`OutboxRelayWorker` e `SqsSagaStepWorker`).
+A aplicação subirá em `http://localhost:3000`, conectará automaticamente ao PostgreSQL (`order_saga_db`) e iniciará os workers de background (`OutboxRelayWorker`, `SqsOrderEventsWorker` e `SqsSagaStepWorker`).
 
 ---
 
-## 2. Roteiro de Implementação na Branch `practice/saga`
+## 2. Roteiro da Arquitetura (Peças-Chave)
 
-Se você estiver na branch `practice/saga`, implemente os `TODO`s nesta sequência:
-
-1. [`src/modules/order/application/create-order.use-case.ts`](./src/modules/order/application/create-order.use-case.ts): Criar o `MessageWrapper` e salvar o evento `'ORDER_WORKFLOW_REQUESTED'` na Outbox dentro da `unitOfWork`.
-2. [`src/modules/order/application/execute-saga-step.use-case.ts`](./src/modules/order/application/execute-saga-step.use-case.ts): Implementar a coordenação agnóstica `Inbox` ➔ `UseCase de Domínio` ➔ `Outbox ('WORKFLOW_STEP_COMPLETED' | 'WORKFLOW_STEP_FAILED')`.
-3. [`src/modules/order/application/relay-outbox.use-case.ts`](./src/modules/order/application/relay-outbox.use-case.ts): Ler mensagens `PENDING` da Outbox e chamar `this._orderWorkflow` (`startOrderWorkflow`, `completeWorkflowStep`, `failWorkflowStep`).
-4. [`src/infra/aws/translators/sfn-acl.translator.ts`](./src/infra/aws/translators/sfn-acl.translator.ts): Implementar a camada de tradução (ACL) entre os tipos da AWS (`taskToken`, `executionArn`, `payload.error`) e os tipos agnósticos da aplicação (`correlationToken`, `workflowInstanceId`, `payload.failure`).
-5. [`src/infra/aws/sfn-order-workflow.adapter.ts`](./src/infra/aws/sfn-order-workflow.adapter.ts) e [`src/infra/aws/sqs-saga-step.worker.ts`](./src/infra/aws/sqs-saga-step.worker.ts): Conectar os comandos do `@aws-sdk/client-sfn` e `@aws-sdk/client-sqs`.
-6. [`infra/statemachine/order-saga.asl.json`](./infra/statemachine/order-saga.asl.json): Completar os estados da State Machine (`ReserveStock` ➔ `ProcessPayment` ➔ `CreateShipment` ➔ `ConfirmOrder` e os rollbacks `RefundPayment` ➔ `ReleaseStock` ➔ `CancelOrder`) e rodar `cd infra && terraform apply -auto-approve`.
-
-> **Dica:** A qualquer momento você pode comparar sua implementação com o gabarito na `master`:
-> ```bash
-> git diff master -- src/modules/order/application/execute-saga-step.use-case.ts
-> ```
+1. [`src/modules/order/application/create-order.use-case.ts`](./src/modules/order/application/create-order.use-case.ts): Cria o `MessageWrapper` e salva o evento de domínio `'ORDER_CREATED'` na Outbox dentro do `unitOfWork`.
+2. [`src/shared/messaging/outbox-relay.service.ts`](./src/shared/messaging/outbox-relay.service.ts): Lê mensagens `PENDING` da Outbox (`FOR UPDATE SKIP LOCKED`) e publica via [`MessagePublisherPort`](./src/shared/messaging/message-publisher.port.ts).
+3. [`src/modules/order/application/execute-saga-step.use-case.ts`](./src/modules/order/application/execute-saga-step.use-case.ts): Coordenação agnóstica `Inbox` + `UseCase de Domínio` dentro do `UnitOfWork` ➔ callback direto via `OrderWorkflowPort` (`completeWorkflowStep` / `failWorkflowStep`) com replay idempotente pelo Inbox em caso de reentrega.
+4. [`src/infra/aws/translators/sfn-acl.translator.ts`](./src/infra/aws/translators/sfn-acl.translator.ts): Camada de tradução (ACL) entre os tipos da AWS (`taskToken`, `executionArn`, `payload.error`) e os tipos agnósticos da aplicação (`correlationToken`, `workflowInstanceId`, `payload.failure`).
+5. [`src/infra/aws/sfn-order-workflow.adapter.ts`](./src/infra/aws/sfn-order-workflow.adapter.ts), [`src/infra/aws/sqs-order-events.worker.ts`](./src/infra/aws/sqs-order-events.worker.ts) e [`src/infra/aws/sqs-saga-step.worker.ts`](./src/infra/aws/sqs-saga-step.worker.ts): Adaptadores e workers AWS (`@aws-sdk/client-sfn` e `@aws-sdk/client-sqs`).
+6. [`infra/statemachine/order-saga.asl.json`](./infra/statemachine/order-saga.asl.json): Definição ASL da State Machine (`ReserveStock` ➔ `ProcessPayment` ➔ `CreateShipment` ➔ `ConfirmOrder` e os rollbacks `RefundPayment` ➔ `ReleaseStock` ➔ `CancelOrder`).
 
 ---
 
@@ -259,9 +246,9 @@ AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
 
 ### 4.2 Inspecionar as Tabelas Reais no PostgreSQL via `psql`
 ```bash
-# 1. Ver eventos da Transactional Outbox (ORDER_WORKFLOW_REQUESTED, WORKFLOW_STEP_COMPLETED, WORKFLOW_STEP_FAILED)
+# 1. Ver eventos da Transactional Outbox (ORDER_CREATED)
 docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
-  "SELECT id, order_id, event_type, status, workflow_instance_id, created_at, published_at FROM outbox_messages ORDER BY created_at;"
+  "SELECT id, order_id, event_type, status, created_at, published_at FROM outbox_messages ORDER BY created_at;"
 
 # 2. Ver chaves de idempotência na Transactional Inbox (PRIMARY KEY order_id:step_name)
 docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
