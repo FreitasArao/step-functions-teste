@@ -5,6 +5,8 @@ import {
   type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
+import { NativeConnection, Worker } from '@temporalio/worker';
+import { fileURLToPath } from 'node:url';
 import {
   EXECUTE_SAGA_STEP_INBOUND_PORT,
   type ExecuteSagaStepInboundPort,
@@ -13,23 +15,26 @@ import {
 } from '../../modules/order/application/ports/saga-step.inbound-port.js';
 import type { DomainError } from '../../shared/core/domain-error.js';
 import type { Result } from '../../shared/core/result.js';
+import { createOrderSagaActivities } from './activities/order-saga.activities.js';
 import { TemporalConnectionService } from './temporal-client.provider.js';
 import { TemporalLocalEngineService } from './temporal-local-engine.service.js';
 import { TemporalSagaStepActivityHandler } from './temporal-saga-step-activity.handler.js';
+import { TEMPORAL_ORDER_SAGA_TASK_QUEUE } from './translators/temporal-acl.translator.js';
 
 /**
- * Driving Worker used ONLY in local emulator test mode (`NODE_ENV=test` / `USE_LOCAL_TEMPORAL_ENGINE=true`)
- * to drain activity tasks from `TemporalLocalEngineService` and invoke `TemporalSagaStepActivityHandler`.
- *
- * When connected to a real Temporal Server, the official `@temporalio/worker` invokes
- * `TemporalSagaStepActivityHandler.handle(envelope)` directly inside the Activity (Temporal Server
- * itself is the durable queue, with zero in-memory intermediate buffer).
+ * Driving Worker for Temporal Saga Steps:
+ * - In live Temporal mode, starts the official `@temporalio/worker` polling `order-saga-task-queue`.
+ * - In local emulator test mode (`NODE_ENV=test` / `USE_LOCAL_TEMPORAL_ENGINE=true`), drains
+ *   activity tasks from `TemporalLocalEngineService`.
  */
 @Injectable()
 export class TemporalSagaStepWorker implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TemporalSagaStepWorker.name);
   private timer?: ReturnType<typeof setInterval>;
   private isPolling = false;
+  private nativeConnection?: NativeConnection;
+  private worker?: Worker;
+  private workerRunPromise?: Promise<void>;
 
   constructor(
     private readonly activityHandler: TemporalSagaStepActivityHandler,
@@ -39,22 +44,75 @@ export class TemporalSagaStepWorker implements OnModuleInit, OnModuleDestroy {
     private readonly temporalConnection: TemporalConnectionService,
   ) {}
 
-  onModuleInit(): void {
-    if (
-      process.env.DISABLE_BACKGROUND_WORKERS === 'true' ||
-      !this.temporalConnection.isLocalEngineMode()
-    ) {
+  async onModuleInit(): Promise<void> {
+    if (process.env.DISABLE_BACKGROUND_WORKERS === 'true') {
       return;
     }
-    const intervalMs = Number(process.env.TEMPORAL_STEP_POLL_INTERVAL_MS ?? 200);
-    this.timer = setInterval(() => {
-      void this.pollActivityQueueOnce();
-    }, intervalMs);
+
+    if (this.temporalConnection.isLocalEngineMode()) {
+      const intervalMs = Number(
+        process.env.TEMPORAL_STEP_POLL_INTERVAL_MS ?? 200,
+      );
+      this.timer = setInterval(() => {
+        void this.pollActivityQueueOnce();
+      }, intervalMs);
+      return;
+    }
+
+    if (await this.temporalConnection.isServerReachable()) {
+      await this.startEmbeddedWorker();
+    }
   }
 
-  onModuleDestroy(): void {
+  private async startEmbeddedWorker(): Promise<void> {
+    try {
+      this.nativeConnection = await NativeConnection.connect({
+        address: this.temporalConnection.address,
+      });
+      const workflowsPath = fileURLToPath(
+        new URL('./workflows/order-saga.workflow.js', import.meta.url),
+      );
+
+      this.worker = await Worker.create({
+        connection: this.nativeConnection,
+        namespace: this.temporalConnection.namespace,
+        taskQueue: TEMPORAL_ORDER_SAGA_TASK_QUEUE,
+        workflowsPath,
+        activities: createOrderSagaActivities((envelope) =>
+          this.activityHandler.handle(envelope),
+        ),
+      });
+
+      this.workerRunPromise = this.worker.run().catch((err) => {
+        this.logger.error(
+          `[Temporal Worker] Stopped with error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+
+      this.logger.log(
+        `[Temporal Worker] Polling TaskQueue='${TEMPORAL_ORDER_SAGA_TASK_QUEUE}' for Workflows & Activities`,
+      );
+    } catch (err) {
+      this.logger.error(
+        `[Temporal Worker] Could not start Temporal Worker: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
+    }
+    try {
+      if (this.worker) {
+        this.worker.shutdown();
+        await this.workerRunPromise;
+      }
+      if (this.nativeConnection) {
+        await this.nativeConnection.close();
+      }
+    } catch {
+      // Ignore cleanup errors on shutdown
     }
   }
 

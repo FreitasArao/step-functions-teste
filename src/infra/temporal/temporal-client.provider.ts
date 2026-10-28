@@ -10,19 +10,13 @@ import {
   Connection,
   WorkflowClient,
 } from '@temporalio/client';
-import { NativeConnection, Worker } from '@temporalio/worker';
 import { Socket } from 'node:net';
-import { fileURLToPath } from 'node:url';
-import { createOrderSagaActivities } from './activities/order-saga.activities.js';
-import { TemporalSagaStepActivityHandler } from './temporal-saga-step-activity.handler.js';
-import { TEMPORAL_ORDER_SAGA_TASK_QUEUE } from './translators/temporal-acl.translator.js';
 
 const RECONNECT_INTERVAL_MS = 5_000;
 
 /**
  * The in-process Temporal emulator is an explicit TEST DOUBLE.
- * It is never used as a silent fallback when the real Temporal Server is down
- * (that would let the Outbox mark messages as PUBLISHED into volatile memory).
+ * It is never used as a silent fallback when the real Temporal Server is down.
  */
 export function isLocalTemporalEngineMode(): boolean {
   return (
@@ -38,15 +32,8 @@ export class TemporalConnectionService
   private readonly logger = new Logger(TemporalConnectionService.name);
   private connection?: Connection;
   private client?: Client;
-  private nativeConnection?: NativeConnection;
-  private worker?: Worker;
-  private workerRunPromise?: Promise<void>;
   private connecting?: Promise<boolean>;
   private lastAttemptAt = 0;
-
-  constructor(
-    private readonly activityHandler: TemporalSagaStepActivityHandler,
-  ) {}
 
   get address(): string {
     return process.env.TEMPORAL_ADDRESS ?? 'localhost:7233';
@@ -70,16 +57,16 @@ export class TemporalConnectionService
     await this.ensureConnected();
   }
 
-  /**
-   * Returns the WorkflowClient or null when Temporal is unreachable.
-   * Callers MUST return Result.err in that case so the Outbox keeps the message PENDING.
-   */
   async getWorkflowClient(): Promise<WorkflowClient | null> {
     return (await this.ensureConnected()) ? (this.client?.workflow ?? null) : null;
   }
 
   async getAsyncCompletionClient(): Promise<AsyncCompletionClient | null> {
     return (await this.ensureConnected()) ? (this.client?.activity ?? null) : null;
+  }
+
+  async isServerReachable(): Promise<boolean> {
+    return this.ensureConnected();
   }
 
   private async ensureConnected(): Promise<boolean> {
@@ -115,10 +102,6 @@ export class TemporalConnectionService
       this.logger.log(
         `[Temporal] Connected to Temporal Server at ${this.address} (namespace=${this.namespace})`,
       );
-
-      if (process.env.DISABLE_BACKGROUND_WORKERS !== 'true') {
-        await this.startEmbeddedWorker();
-      }
       return true;
     } catch (err) {
       this.client = undefined;
@@ -129,50 +112,8 @@ export class TemporalConnectionService
     }
   }
 
-  private async startEmbeddedWorker(): Promise<void> {
-    try {
-      this.nativeConnection = await NativeConnection.connect({
-        address: this.address,
-      });
-      const workflowsPath = fileURLToPath(
-        new URL('./workflows/order-saga.workflow.js', import.meta.url),
-      );
-
-      this.worker = await Worker.create({
-        connection: this.nativeConnection,
-        namespace: this.namespace,
-        taskQueue: TEMPORAL_ORDER_SAGA_TASK_QUEUE,
-        workflowsPath,
-        activities: createOrderSagaActivities((envelope) =>
-          this.activityHandler.handle(envelope),
-        ),
-      });
-
-      this.workerRunPromise = this.worker.run().catch((err) => {
-        this.logger.error(
-          `[Temporal Worker] Stopped with error: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
-
-      this.logger.log(
-        `[Temporal Worker] Polling TaskQueue='${TEMPORAL_ORDER_SAGA_TASK_QUEUE}' for Workflows & Activities`,
-      );
-    } catch (err) {
-      this.logger.error(
-        `[Temporal Worker] Could not start Temporal Worker: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-
   async onModuleDestroy(): Promise<void> {
     try {
-      if (this.worker) {
-        this.worker.shutdown();
-        await this.workerRunPromise;
-      }
-      if (this.nativeConnection) {
-        await this.nativeConnection.close();
-      }
       if (this.connection) {
         await this.connection.close();
       }

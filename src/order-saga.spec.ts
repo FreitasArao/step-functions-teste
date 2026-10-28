@@ -240,17 +240,12 @@ describe('Domain Logic, Use Cases (Result Pattern), Temporal.io Adapter & Databa
         'CREATE_SHIPMENT',
         'CONFIRM_ORDER',
       ]);
+      // Outbox contains ONLY the domain event 'ORDER_CREATED' (never step callbacks)
       expect(
         diagResult.value.transactionalMessaging.outboxEvents.map(
           (e) => e.eventType,
         ),
-      ).toEqual([
-        'ORDER_CREATED',
-        'WORKFLOW_STEP_COMPLETED',
-        'WORKFLOW_STEP_COMPLETED',
-        'WORKFLOW_STEP_COMPLETED',
-        'WORKFLOW_STEP_COMPLETED',
-      ]);
+      ).toEqual(['ORDER_CREATED']);
       expect(
         diagResult.value.transactionalMessaging.outboxEvents.every(
           (e) => e.status === 'PUBLISHED',
@@ -421,10 +416,7 @@ describe('Domain Logic, Use Cases (Result Pattern), Temporal.io Adapter & Databa
       const outboxForOrder = dump.tables.outbox_messages.filter(
         (m) => m.orderId === 'ord_idempotent_test',
       );
-      expect(outboxForOrder).toHaveLength(2);
-      expect(outboxForOrder[0]?.correlationToken).not.toBe(
-        outboxForOrder[1]?.correlationToken,
-      );
+      expect(outboxForOrder).toHaveLength(0);
     });
   });
 });

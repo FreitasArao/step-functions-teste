@@ -93,7 +93,7 @@ try {
 
 ---
 
-## 3. Fluxo Completo ao Bater em `POST /orders` com Temporal.io (Transactional Outbox + Inbox Reais)
+## 3. Fluxo Completo ao Bater em `POST /orders` com Temporal.io (Transactional Outbox + Inbox Puros)
 
 ```text
 1. [HTTP POST /orders]
@@ -101,12 +101,12 @@ try {
      ▼
 2. [CreateOrderUseCase + PostgresUnitOfWork] (Transação ACID #1)
      ├── Salva Order (status = 'PENDING') na tabela `orders`
-     └── Salva evento 'ORDER_CREATED' (status = 'PENDING') com MessageWrapper na `outbox_messages`
+     └── Salva evento de domínio 'ORDER_CREATED' (status = 'PENDING') com MessageWrapper na `outbox_messages`
      │
      ▼
-3. [OutboxRelayWorker -> RelayOutboxUseCase] (`FOR UPDATE SKIP LOCKED`)
+3. [OutboxRelayWorker -> OutboxRelayService] (100% Genérico + `FOR UPDATE SKIP LOCKED`)
      ├── Lê mensagens 'PENDING' da `outbox_messages` dentro de uma transação
-     ├── Entrega 'ORDER_CREATED' via `OrderWorkflowPort.startOrderWorkflow(wrapper)`
+     ├── Publica via `MessagePublisherPort` (`TemporalEventPublisherAdapter` -> `OrderWorkflowPort.startOrderWorkflow`)
      │   (idempotente no Temporal via `workflowId: order-saga-<orderId>` + `REJECT_DUPLICATE`)
      └── Marca como 'PUBLISHED' SOMENTE após o ACK do Temporal Server
      │
@@ -115,24 +115,23 @@ try {
      ├── O Workflow entra no passo ('RESERVE_STOCK', 'PROCESS_PAYMENT', etc.)
      ├── A Activity captura o `activityInfo().taskToken` binário do Temporal (em Base64)
      ├── Invoca diretamente `TemporalSagaStepActivityHandler.handle(envelope)` (sem fila em memória!)
-     └── Ao concluir a gravação ACID no banco, lança `CompleteAsyncError` (pausando a Activity no Temporal)
+     └── Após a confirmação do callback, lança `CompleteAsyncError`
      │
      ▼
-5. [TemporalAclTranslator -> ExecuteSagaStepUseCase] (Transação ACID #2)
+5. [TemporalAclTranslator -> ExecuteSagaStepUseCase] (Transação ACID #2 — Apenas Inbox + Domínio)
      ├── Traduz o envelope do Temporal para `WorkflowStepCommand` agnóstico (`correlationToken`)
-     ├── Abre transação ACID única no Postgres (`PostgresUnitOfWork`):
+     ├── Abre transação ACID no Postgres (`PostgresUnitOfWork`):
      │     1. Verifica idempotência na tabela `inbox_messages` (`orderId:stepName`)
      │     2. Executa o Use Case de Domínio puro (`Result<T, DomainError>`) — apenas na 1ª entrega
-     │     3. Salva na `inbox_messages` (`outcome = 'OK'` ou `'ERR'`)
-     │     4. Salva na `outbox_messages` (`WORKFLOW_STEP_COMPLETED` ou `WORKFLOW_STEP_FAILED` + `correlationToken`)
-     └── Commita Tudo ou Nada (zero chamada de rede dentro da transação = zero Dual-Write!)
+     │     3. Salva na `inbox_messages` (`outcome = 'OK'` ou `'ERR'` + `responsePayload`)
+     └── Commita a transação (NÃO suja a Outbox com callbacks de step!)
      │
      ▼
-6. [OutboxRelayWorker -> RelayOutboxUseCase -> `AsyncCompletionClient` do Temporal]
-     ├── Lê `WORKFLOW_STEP_COMPLETED` / `WORKFLOW_STEP_FAILED` pendentes da `outbox_messages`
-     ├── Se 'WORKFLOW_STEP_COMPLETED' -> `AsyncCompletionClient.complete(taskToken, output)` -> avança para a próxima Activity!
-     ├── Se 'WORKFLOW_STEP_FAILED'    -> `AsyncCompletionClient.fail(taskToken, ApplicationFailure)` -> cai no `catch` do Workflow e roda a pilha `compensations`!
-     └── Marca o registro da Outbox como 'PUBLISHED' (tratando `ActivityNotFoundError` como no-op idempotente)
+6. [Callback via `OrderWorkflowPort` (`AsyncCompletionClient` do Temporal)]
+     ├── Se 'OK'  -> `AsyncCompletionClient.complete(taskToken, output)` -> avança para a próxima Activity!
+     ├── Se 'ERR' -> `AsyncCompletionClient.fail(taskToken, ApplicationFailure)` -> cai no `catch` do Workflow e roda a pilha `compensations`!
+     └── Se o callback de rede falhar, a Activity falha e o Temporal reentrega a mensagem:
+         na reentrega, a `inbox_messages` evita reexecutar o domínio (`deduplicated = true`) e apenas reenvia o callback!
 ```
 
 ---
