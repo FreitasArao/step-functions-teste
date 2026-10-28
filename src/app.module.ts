@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { createObserveModule } from '@nestjs/observe';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
+import { AslLocalEngineService } from './infra/aws/asl-local-engine.service.js';
 import {
   createSfnClient,
   createSqsClient,
@@ -11,6 +12,8 @@ import {
 import { OutboxRelayWorker } from './infra/aws/outbox-relay.worker.js';
 import { SagaPipelineRunnerService } from './infra/aws/saga-pipeline-runner.service.js';
 import { StepFunctionsOrderWorkflowAdapter } from './infra/aws/sfn-order-workflow.adapter.js';
+import { SqsMessagePublisherAdapter } from './infra/aws/sqs-message-publisher.adapter.js';
+import { SqsOrderEventsWorker } from './infra/aws/sqs-order-events.worker.js';
 import { SqsSagaStepWorker } from './infra/aws/sqs-saga-step.worker.js';
 import { AwsStepFunctionsTranslator } from './infra/aws/translators/sfn-acl.translator.js';
 import { PostgresDatabaseService } from './infra/database/postgres-client.provider.js';
@@ -28,8 +31,8 @@ import { ConfirmOrderUseCase } from './modules/order/application/confirm-order.u
 import { CreateOrderUseCase } from './modules/order/application/create-order.use-case.js';
 import { ExecuteSagaStepUseCase } from './modules/order/application/execute-saga-step.use-case.js';
 import { GetOrderDiagnosticsUseCase } from './modules/order/application/get-order-diagnostics.use-case.js';
-import { RelayOutboxUseCase } from './modules/order/application/relay-outbox.use-case.js';
-import { ORDER_WORKFLOW_PORT } from './modules/order/domain/order-workflow.port.js';
+import { ORDER_WORKFLOW_PORT } from './modules/order/application/ports/order-workflow.outbound-port.js';
+import { EXECUTE_SAGA_STEP_INBOUND_PORT } from './modules/order/application/ports/saga-step.inbound-port.js';
 import { ORDER_REPOSITORY_PORT } from './modules/order/domain/order.repository.port.js';
 import { OrderController } from './modules/order/infra/http/order.controller.js';
 import { InMemoryOrderRepository } from './modules/order/infra/in-memory-order.repository.js';
@@ -53,6 +56,8 @@ import {
   InMemoryOutboxRepository,
 } from './shared/messaging/in-memory-messaging.store.js';
 import { INBOX_REPOSITORY_PORT } from './shared/messaging/inbox.port.js';
+import { MESSAGE_PUBLISHER_PORT } from './shared/messaging/message-publisher.port.js';
+import { OutboxRelayService } from './shared/messaging/outbox-relay.service.js';
 import { OUTBOX_REPOSITORY_PORT } from './shared/messaging/outbox.port.js';
 import { UNIT_OF_WORK_PORT } from './shared/messaging/unit-of-work.port.js';
 
@@ -125,13 +130,19 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       useExisting: PostgresShipmentRepository,
     },
 
+    // Generic Messaging Services (100% Agnostic Outbox Relay)
+    OutboxRelayService,
+
     // Domain & Application Use Cases (100% Agnostic of AWS/StepFunctions/SQS)
     CreateOrderUseCase,
     ConfirmOrderUseCase,
     CancelOrderUseCase,
     GetOrderDiagnosticsUseCase,
     ExecuteSagaStepUseCase,
-    RelayOutboxUseCase,
+    {
+      provide: EXECUTE_SAGA_STEP_INBOUND_PORT,
+      useExisting: ExecuteSagaStepUseCase,
+    },
     ReserveStockUseCase,
     ReleaseStockUseCase,
     ProcessPaymentUseCase,
@@ -147,13 +158,20 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       provide: SQS_CLIENT,
       useFactory: createSqsClient,
     },
+    SqsMessagePublisherAdapter,
+    {
+      provide: MESSAGE_PUBLISHER_PORT,
+      useExisting: SqsMessagePublisherAdapter,
+    },
     AwsStepFunctionsTranslator,
+    AslLocalEngineService,
     StepFunctionsOrderWorkflowAdapter,
     {
       provide: ORDER_WORKFLOW_PORT,
       useExisting: StepFunctionsOrderWorkflowAdapter,
     },
     OutboxRelayWorker,
+    SqsOrderEventsWorker,
     SqsSagaStepWorker,
     SagaPipelineRunnerService,
   ],

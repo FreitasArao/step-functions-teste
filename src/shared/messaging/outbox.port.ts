@@ -2,12 +2,9 @@ import type { DomainError } from '../core/domain-error.js';
 import type { MessageWrapper } from './message-wrapper.js';
 
 /**
- * Cloud-agnostic workflow outbox event types.
+ * Cloud-agnostic domain outbox event types.
  */
-export type OutboxEventType =
-  | 'ORDER_WORKFLOW_REQUESTED'
-  | 'WORKFLOW_STEP_COMPLETED'
-  | 'WORKFLOW_STEP_FAILED';
+export type OutboxEventType = 'ORDER_CREATED' | (string & {});
 
 export type OutboxStatus = 'PENDING' | 'PUBLISHED' | 'FAILED';
 

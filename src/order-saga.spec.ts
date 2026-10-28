@@ -205,7 +205,7 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
     expect(dump.tables.outbox_messages).toHaveLength(0);
   });
 
-  describe.skip('TODO (Prática): Saga Completa com Outbox Agnóstico, AWS ACL Translator, Step Functions, SQS e Inbox', () => {
+  describe('Saga Completa com Outbox Agnóstico, AWS ACL Translator, Step Functions, SQS e Inbox', () => {
     it('Scenario 1 (Happy Path): executes ReserveStock -> ProcessPayment -> CreateShipment -> ConfirmOrder', async () => {
       const createResult = await createOrderUseCase.execute({
         sku: 'SKU-100',

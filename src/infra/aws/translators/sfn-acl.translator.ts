@@ -8,8 +8,12 @@ import { Injectable } from '@nestjs/common';
 import type {
   StartSagaPayload,
   WorkflowExecutionSummary,
+} from '../../../modules/order/application/ports/order-workflow.outbound-port.js';
+import type {
+  SagaStepContextPayload,
+  WorkflowFailureDetails,
   WorkflowStepCommand,
-} from '../../../modules/order/domain/order-workflow.port.js';
+} from '../../../modules/order/application/ports/saga-step.inbound-port.js';
 import type { DomainError } from '../../../shared/core/domain-error.js';
 import {
   createMessageWrapper,
@@ -18,6 +22,9 @@ import {
   type SagaStepName,
 } from '../../../shared/messaging/message-wrapper.js';
 
+/**
+ * Raw AWS Step Functions -> SQS envelope defined in order-saga.asl.json
+ */
 export interface AwsSfnSqsTaskEnvelope {
   readonly stepName: SagaStepName;
   readonly idempotencyKey: string;
@@ -38,75 +45,159 @@ export interface AwsSfnSqsTaskEnvelope {
 }
 
 /**
- * TODO (Prática - Camada de Tradução / Anti-Corruption Layer AWS):
- * Traduz entre os contratos específicos da AWS (Step Functions + SQS)
- * e os contratos agnósticos da camada de Aplicação/Domínio.
+ * Anti-Corruption Layer (ACL) / Translation Layer between:
+ * - AWS Step Functions + SQS (TaskToken, ExecutionArn, ASL Error/Cause format)
+ * - Agnostic Application & Domain Contracts (MessageWrapper, WorkflowStepCommand, DomainError, WorkflowExecutionSummary)
  */
 @Injectable()
 export class AwsStepFunctionsTranslator {
+  /**
+   * Translates an agnostic MessageWrapper<StartSagaPayload> into AWS StartExecutionCommandInput.
+   */
   toStartExecutionInput(
     stateMachineArn: string,
     wrapper: MessageWrapper<StartSagaPayload>,
   ): StartExecutionCommandInput {
-    // TODO: Traduzir MessageWrapper agnóstico para StartExecutionCommandInput do Step Functions
     return {
       stateMachineArn,
       name: wrapper.payload.orderId,
-      input: JSON.stringify(wrapper),
+      input: JSON.stringify({
+        metadata: wrapper.metadata,
+        payload: wrapper.payload,
+      }),
     };
   }
 
+  /**
+   * Translates an agnostic step completion into AWS SendTaskSuccessCommandInput.
+   */
   toSendTaskSuccessInput(params: {
     correlationToken: string;
     output: unknown;
   }): SendTaskSuccessCommandInput {
-    // TODO: Traduzir correlationToken -> taskToken e serializar output
     return {
       taskToken: params.correlationToken,
       output: JSON.stringify(params.output ?? {}),
     };
   }
 
+  /**
+   * Translates a DomainError into AWS SendTaskFailureCommandInput.
+   */
   toSendTaskFailureInput(params: {
     correlationToken: string;
     error: DomainError;
   }): SendTaskFailureCommandInput {
-    // TODO: Traduzir DomainError (code, message) -> error e cause do Step Functions
     return {
       taskToken: params.correlationToken,
       error: params.error.code,
-      cause: JSON.stringify(params.error),
-    };
-  }
-
-  toWorkflowStepCommand(rawSqsBody: string): WorkflowStepCommand {
-    // TODO: Traduzir o JSON bruto recebido do SQS (AwsSfnSqsTaskEnvelope com taskToken e payload.error)
-    // para o comando agnóstico WorkflowStepCommand (com correlationToken e payload.failure)
-    const raw = JSON.parse(rawSqsBody) as AwsSfnSqsTaskEnvelope;
-    return {
-      stepName: raw.stepName,
-      idempotencyKey: raw.idempotencyKey,
-      correlationToken: raw.taskToken,
-      wrapper: createMessageWrapper({
-        payload: raw.payload,
-        correlationId: raw.payload.orderId,
-        source: 'aws-sfn-acl',
-        traceContext: raw.metadata?.traceContext ?? {},
-        stepName: raw.stepName,
-        idempotencyKey: raw.idempotencyKey,
+      cause: JSON.stringify({
+        code: params.error.code,
+        message: params.error.message,
+        retryable: params.error.retryable ?? false,
+        metadata: params.error.metadata ?? {},
       }),
     };
   }
 
+  /**
+   * Translates a raw AWS SQS MessageBody emitted by Step Functions (.waitForTaskToken)
+   * into a pure, cloud-agnostic WorkflowStepCommand for the Application Layer.
+   */
+  toWorkflowStepCommand(rawSqsBody: string): WorkflowStepCommand {
+    const raw = JSON.parse(rawSqsBody) as AwsSfnSqsTaskEnvelope;
+    const failure = this.extractFailureFromAslError(raw.payload.error);
+
+    const agnosticPayload: SagaStepContextPayload = {
+      ...raw.payload,
+      ...(failure ? { failure } : {}),
+    };
+
+    const wrapper: MessageWrapper<SagaStepContextPayload> = {
+      stepName: raw.stepName,
+      idempotencyKey: raw.idempotencyKey,
+      metadata:
+        raw.metadata ??
+        createMessageWrapper({
+          payload: agnosticPayload,
+          correlationId: raw.payload.orderId,
+          source: 'aws-sfn-acl',
+          traceContext: {},
+        }).metadata,
+      payload: agnosticPayload,
+    };
+
+    return {
+      stepName: raw.stepName,
+      idempotencyKey:
+        raw.idempotencyKey ?? `${raw.payload.orderId}:${raw.stepName}`,
+      correlationToken: raw.taskToken,
+      wrapper,
+    };
+  }
+
+  /**
+   * Translates AWS DescribeExecutionCommandOutput into an agnostic WorkflowExecutionSummary.
+   */
   toWorkflowExecutionSummary(
     executionArn: string,
-    _awsOutput: DescribeExecutionCommandOutput,
+    awsOutput: DescribeExecutionCommandOutput,
   ): WorkflowExecutionSummary {
-    // TODO: Traduzir status do Step Functions (SUCCEEDED, FAILED, RUNNING)
-    // para o status agnóstico do domínio (COMPLETED, ROLLED_BACK, FAILED, RUNNING)
+    const awsStatus = awsOutput.status;
+    let status: WorkflowExecutionSummary['status'] = 'RUNNING';
+
+    if (awsStatus === 'SUCCEEDED') {
+      status = 'COMPLETED';
+    } else if (awsStatus === 'FAILED') {
+      status =
+        awsOutput.error === 'ORDER_SAGA_ROLLED_BACK'
+          ? 'ROLLED_BACK'
+          : 'FAILED';
+    } else if (awsStatus === 'TIMED_OUT' || awsStatus === 'ABORTED') {
+      status = 'FAILED';
+    }
+
     return {
       workflowInstanceId: executionArn,
-      status: 'RUNNING',
+      status,
+      ...(awsOutput.startDate
+        ? { startedAt: awsOutput.startDate.toISOString() }
+        : {}),
+      ...(awsOutput.stopDate
+        ? { finishedAt: awsOutput.stopDate.toISOString() }
+        : {}),
+      ...(awsOutput.error ? { failureCode: awsOutput.error } : {}),
+      ...(awsOutput.cause ? { failureReason: awsOutput.cause } : {}),
+    };
+  }
+
+  private extractFailureFromAslError(aslError?: {
+    readonly Error?: string;
+    readonly Cause?: string;
+  }): WorkflowFailureDetails | undefined {
+    if (!aslError) {
+      return undefined;
+    }
+    if (aslError.Cause) {
+      try {
+        const parsed = JSON.parse(aslError.Cause) as {
+          code?: string;
+          message?: string;
+        };
+        return {
+          code: parsed.code ?? aslError.Error,
+          message: parsed.message ?? aslError.Cause,
+        };
+      } catch {
+        return {
+          code: aslError.Error,
+          message: aslError.Cause,
+        };
+      }
+    }
+    return {
+      code: aslError.Error,
+      message: aslError.Error,
     };
   }
 }

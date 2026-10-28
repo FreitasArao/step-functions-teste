@@ -25,6 +25,22 @@ provider "aws" {
   }
 }
 
+resource "aws_sqs_queue" "order_events_dlq" {
+  name                      = "order-events-dlq"
+  message_retention_seconds = 86400
+}
+
+resource "aws_sqs_queue" "order_events_queue" {
+  name                       = "order-events-queue"
+  visibility_timeout_seconds = 30
+  receive_wait_time_seconds  = 5
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.order_events_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
 resource "aws_sqs_queue" "order_saga_dlq" {
   name                      = "order-saga-tasks-dlq"
   message_retention_seconds = 86400

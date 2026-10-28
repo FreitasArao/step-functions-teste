@@ -38,7 +38,7 @@ import {
   ORDER_WORKFLOW_PORT,
   type OrderWorkflowPort,
   type WorkflowExecutionSummary,
-} from '../domain/order-workflow.port.js';
+} from './ports/order-workflow.outbound-port.js';
 import type { OrderProps } from '../domain/order.entity.js';
 import { OrderNotFoundError } from '../domain/order.errors.js';
 import {

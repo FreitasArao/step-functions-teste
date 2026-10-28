@@ -1,15 +1,20 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import {
   TELEMETRY_PORT,
   type TelemetryPort,
 } from '../../../infra/telemetry/tracer.js';
 import type { DomainError } from '../../../shared/core/domain-error.js';
 import { Result } from '../../../shared/core/result.js';
-import type { TraceContextCarrier } from '../../../shared/messaging/message-wrapper.js';
+import {
+  createMessageWrapper,
+  type TraceContextCarrier,
+} from '../../../shared/messaging/message-wrapper.js';
 import {
   UNIT_OF_WORK_PORT,
   type UnitOfWorkPort,
 } from '../../../shared/messaging/unit-of-work.port.js';
+import type { StartSagaPayload } from './ports/order-workflow.outbound-port.js';
 import { Order, type OrderProps } from '../domain/order.entity.js';
 import {
   ORDER_REPOSITORY_PORT,
@@ -58,7 +63,7 @@ export class CreateOrderUseCase {
 
     const order = orderResult.value;
 
-    return this.telemetry.runInSpan(
+    const result=  await this.telemetry.runInSpan(
       {
         operationName: 'order.create',
         resourceName: 'CreateOrderUseCase.execute',
@@ -73,24 +78,48 @@ export class CreateOrderUseCase {
         },
       },
       async (traceCarrier) => {
-        return this.unitOfWork.execute(async ({ outbox: _outbox }) => {
+        return this.unitOfWork.execute(async ({ outbox }) => {
           await this.orderRepository.save(order);
 
-          // TODO (Prática - Transactional Outbox Agnóstico + MessageWrapper):
-          // 1. Monte o StartSagaPayload e crie um MessageWrapper com `createMessageWrapper(...)`
-          // 2. Grave na Outbox (`_outbox.save`) o evento agnóstico:
-          //    - eventType: 'ORDER_WORKFLOW_REQUESTED'
-          //    - status: 'PENDING'
-          //    - wrapper
+          const payload: StartSagaPayload = {
+            orderId: order.id,
+            sku: order.sku,
+            quantity: order.quantity,
+            amount: order.amount,
+            zipCode: order.zipCode,
+          };
+
+          const wrapper = createMessageWrapper({
+            payload,
+            correlationId: order.id,
+            source: 'order.create',
+            traceContext: traceCarrier,
+          });
+
+          const outboxMessageId = `out_${randomUUID()}`;
+          await outbox.save({
+            id: outboxMessageId,
+            orderId: order.id,
+            eventType: 'ORDER_CREATED',
+            status: 'PENDING',
+            wrapper,
+            createdAt: new Date().toISOString(),
+          });
 
           return Result.ok({
             order: order.toJSON(),
-            outboxMessageId: 'todo_outbox_id',
+            outboxMessageId,
             correlationId: order.id,
             traceContext: traceCarrier,
           });
         });
       },
     );
+
+    if(result.isErr()) {
+      return Result.err(result.error);
+    }
+
+    return result
   }
 }
