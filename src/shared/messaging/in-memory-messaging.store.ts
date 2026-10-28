@@ -62,10 +62,7 @@ export class InMemoryOutboxRepository implements OutboxRepositoryPort {
     );
   }
 
-  async markPublished(
-    id: string,
-    metadata?: { workflowInstanceId?: string },
-  ): Promise<void> {
+  async markPublished(id: string): Promise<void> {
     const current = this.items.get(id);
     if (!current) {
       return;
@@ -74,9 +71,6 @@ export class InMemoryOutboxRepository implements OutboxRepositoryPort {
       ...current,
       status: 'PUBLISHED',
       publishedAt: new Date().toISOString(),
-      ...(metadata?.workflowInstanceId
-        ? { workflowInstanceId: metadata.workflowInstanceId }
-        : {}),
     });
   }
 

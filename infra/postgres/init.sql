@@ -69,10 +69,7 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
   order_id VARCHAR(64) NOT NULL,
   event_type VARCHAR(64) NOT NULL,
   status VARCHAR(32) NOT NULL,
-  correlation_token TEXT,
-  error_details JSONB,
   wrapper JSONB NOT NULL,
-  workflow_instance_id TEXT,
   created_at TIMESTAMPTZ NOT NULL,
   published_at TIMESTAMPTZ
 );

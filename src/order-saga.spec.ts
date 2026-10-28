@@ -225,17 +225,12 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
       if (!diagResult.isOk()) return;
 
       expect(diagResult.value.order.status).toBe('CONFIRMED');
+      // Outbox contains ONLY the domain event 'ORDER_CREATED' (never step callbacks)
       expect(
         diagResult.value.transactionalMessaging.outboxEvents.map(
           (e) => e.eventType,
         ),
-      ).toEqual([
-        'ORDER_CREATED',
-        'WORKFLOW_STEP_COMPLETED',
-        'WORKFLOW_STEP_COMPLETED',
-        'WORKFLOW_STEP_COMPLETED',
-        'WORKFLOW_STEP_COMPLETED',
-      ]);
+      ).toEqual(['ORDER_CREATED']);
       expect(
         diagResult.value.transactionalMessaging.outboxEvents.every(
           (e) => e.status === 'PUBLISHED',
@@ -243,7 +238,7 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
       ).toBe(true);
     });
 
-    it('Scenario 5 (Transactional Inbox Idempotency + AWS ACL Translation): duplicate SQS message delivery does not reserve stock twice and replays callback to Outbox', async () => {
+    it('Scenario 5 (Transactional Inbox Idempotency + AWS ACL Translation): duplicate SQS message delivery does not reserve stock twice and replays callback from Inbox without writing to Outbox', async () => {
       const rawSqsBody = JSON.stringify({
         stepName: 'RESERVE_STOCK',
         idempotencyKey: 'ord_idempotent_test:RESERVE_STOCK',
@@ -288,7 +283,7 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
       const outboxForOrder = dump.tables.outbox_messages.filter(
         (m) => m.orderId === 'ord_idempotent_test',
       );
-      expect(outboxForOrder).toHaveLength(2);
+      expect(outboxForOrder).toHaveLength(0);
     });
   });
 });

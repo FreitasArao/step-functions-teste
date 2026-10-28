@@ -40,10 +40,7 @@ interface OutboxRow {
   order_id: string;
   event_type: OutboxEventType;
   status: OutboxStatus;
-  correlation_token: string | null;
-  error_details: DomainError | null;
   wrapper: MessageWrapper<unknown>;
-  workflow_instance_id: string | null;
   created_at: Date | string;
   published_at: Date | string | null;
 }
@@ -70,13 +67,6 @@ function mapOutboxRow(row: OutboxRow): OutboxMessage {
     eventType: row.event_type,
     status: row.status,
     wrapper: row.wrapper,
-    ...(row.correlation_token
-      ? { correlationToken: row.correlation_token }
-      : {}),
-    ...(row.error_details ? { errorDetails: row.error_details } : {}),
-    ...(row.workflow_instance_id
-      ? { workflowInstanceId: row.workflow_instance_id }
-      : {}),
     createdAt:
       row.created_at instanceof Date
         ? row.created_at.toISOString()
@@ -183,22 +173,16 @@ export class PostgresOutboxRepository implements OutboxRepositoryPort {
         order_id,
         event_type,
         status,
-        correlation_token,
-        error_details,
         wrapper,
-        workflow_instance_id,
         created_at,
         published_at
-      ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10)`,
+      ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
       [
         message.id,
         message.orderId,
         message.eventType,
         message.status,
-        message.correlationToken ?? null,
-        message.errorDetails ? JSON.stringify(message.errorDetails) : null,
         JSON.stringify(message.wrapper),
-        message.workflowInstanceId ?? null,
         message.createdAt,
         message.publishedAt ?? null,
       ],
@@ -220,21 +204,17 @@ export class PostgresOutboxRepository implements OutboxRepositoryPort {
     return res.rows.map(mapOutboxRow);
   }
 
-  async markPublished(
-    id: string,
-    metadata?: { workflowInstanceId?: string },
-  ): Promise<void> {
+  async markPublished(id: string): Promise<void> {
     if (!this.db.isPostgresActive()) {
-      return this.fallbackMemory.markPublished(id, metadata);
+      return this.fallbackMemory.markPublished(id);
     }
     const q = this.db.getQueryable();
     await q.query(
       `UPDATE outbox_messages
        SET status = 'PUBLISHED',
-           published_at = NOW(),
-           workflow_instance_id = COALESCE($2, workflow_instance_id)
+           published_at = NOW()
        WHERE id = $1`,
-      [id, metadata?.workflowInstanceId ?? null],
+      [id],
     );
   }
 

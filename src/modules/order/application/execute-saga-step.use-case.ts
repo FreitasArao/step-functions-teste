@@ -1,5 +1,4 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
 import {
   TELEMETRY_PORT,
   type TelemetryPort,
@@ -21,6 +20,10 @@ import { ReleaseStockUseCase } from '../../stock/application/release-stock.use-c
 import { ReserveStockUseCase } from '../../stock/application/reserve-stock.use-case.js';
 import { CancelOrderUseCase } from './cancel-order.use-case.js';
 import { ConfirmOrderUseCase } from './confirm-order.use-case.js';
+import {
+  ORDER_WORKFLOW_PORT,
+  type OrderWorkflowPort,
+} from './ports/order-workflow.outbound-port.js';
 import type {
   ExecuteSagaStepInboundPort,
   ExecuteSagaStepOutput,
@@ -30,21 +33,17 @@ import type {
 
 /**
  * Pure Application Layer Use Case that executes a single Saga step.
- * 100% agnostic of AWS, SQS, Step Functions or Temporal.
+ * 100% agnostic of AWS, SQS, Step Functions, or Temporal.
  *
- * Everything happens inside ONE ACID transaction (UnitOfWork):
- * 1. Transactional Inbox  -> deduplicates the incoming message (idempotencyKey = orderId:stepName).
- * 2. Domain Use Case      -> changes the business state (only on first delivery).
- * 3. Inbox record         -> stores the outcome ('OK' | 'ERR') so redeliveries replay it.
- * 4. Transactional Outbox -> stores the callback to the orchestrator
- *                            (WORKFLOW_STEP_COMPLETED | WORKFLOW_STEP_FAILED + correlationToken).
- *
- * The callback is NEVER sent over the network from here (that would be a dual-write).
- * The Outbox Relay (RelayOutboxUseCase) delivers it through OrderWorkflowPort after COMMIT.
- *
- * On a duplicate delivery (e.g. the orchestrator retried the step with a NEW correlationToken
- * because the previous callback was lost), the stored outcome is replayed into a NEW outbox
- * message bound to the current correlationToken — the domain is NOT executed again.
+ * Why this Use Case uses ONLY the Transactional Inbox (and NEVER writes to the Outbox):
+ * - An incoming step command is a message being CONSUMED, not a new domain event being published.
+ * - Inside ONE ACID transaction (`UnitOfWork`), we check the `Inbox`, execute the Domain Use Case
+ *   (on first delivery), and persist the `outcome ('OK' | 'ERR')` + `responsePayload` in `inbox_messages`.
+ * - After `COMMIT`, we notify the orchestrator via `OrderWorkflowPort.completeWorkflowStep` / `failWorkflowStep`.
+ * - If that network callback fails, `execute()` returns `Result.err` so the driving worker does NOT
+ *   ACK/delete the incoming message. When the broker/orchestrator redeliveries the message, the
+ *   `Inbox` hits (`deduplicated = true`), skips domain execution, and replays the callback using the
+ *   stored `responsePayload` and the current `correlationToken`.
  */
 @Injectable()
 export class ExecuteSagaStepUseCase implements ExecuteSagaStepInboundPort {
@@ -53,6 +52,8 @@ export class ExecuteSagaStepUseCase implements ExecuteSagaStepInboundPort {
   constructor(
     @Inject(UNIT_OF_WORK_PORT)
     private readonly unitOfWork: UnitOfWorkPort,
+    @Inject(ORDER_WORKFLOW_PORT)
+    private readonly orderWorkflow: OrderWorkflowPort,
     @Inject(TELEMETRY_PORT)
     private readonly telemetry: TelemetryPort,
     private readonly reserveStockUseCase: ReserveStockUseCase,
@@ -82,88 +83,108 @@ export class ExecuteSagaStepUseCase implements ExecuteSagaStepInboundPort {
           'idempotency.key': idempotencyKey,
         },
       },
-      async (stepTraceCarrier) =>
-        this.unitOfWork.execute<ExecuteSagaStepOutput, DomainError>(
-          async ({ inbox, outbox }) => {
-            let deduplicated: boolean;
-            let outcome: 'OK' | 'ERR';
-            let responsePayload: unknown;
-
-            // 1. Transactional Inbox: deduplicate
-            const existingInbox =
-              await inbox.findByIdempotencyKey(idempotencyKey);
-
-            if (existingInbox) {
-              this.logger.log(
-                `Idempotent hit in Inbox for key '${idempotencyKey}' - replaying stored outcome '${existingInbox.outcome}' without re-executing the domain`,
-              );
-              deduplicated = true;
-              outcome = existingInbox.outcome;
-              responsePayload = existingInbox.responsePayload;
-            } else {
-              // 2. Domain Use Case (same transaction)
-              const stepResult = await this.dispatchDomainUseCase(
-                stepName,
-                wrapper.payload,
-              );
-              deduplicated = false;
-              outcome = stepResult.isOk() ? 'OK' : 'ERR';
-              responsePayload = stepResult.isOk()
-                ? stepResult.value
-                : toDomainErrorSnapshot(stepResult.error);
-
-              // 3. Inbox record (PRIMARY KEY guarantees a concurrent duplicate rolls back)
-              await inbox.save({
-                idempotencyKey,
-                orderId,
-                stepName,
-                outcome,
-                responsePayload,
-                wrapper: createMessageWrapper<SagaStepContextPayload>({
-                  payload: wrapper.payload,
-                  correlationId: orderId,
-                  causationId: wrapper.metadata?.messageId,
-                  source: `saga-step-executor:${stepName}`,
-                  traceContext: stepTraceCarrier,
-                  stepName,
-                  idempotencyKey,
-                }),
-                processedAt: new Date().toISOString(),
-              });
-            }
-
-            // 4. Transactional Outbox: callback to the orchestrator (same transaction)
-            await outbox.save({
-              id: `out_${randomUUID()}`,
-              orderId,
-              eventType:
-                outcome === 'OK'
-                  ? 'WORKFLOW_STEP_COMPLETED'
-                  : 'WORKFLOW_STEP_FAILED',
-              status: 'PENDING',
-              correlationToken,
-              ...(outcome === 'ERR'
-                ? { errorDetails: responsePayload as DomainError }
-                : {}),
-              wrapper: createMessageWrapper({
-                payload: responsePayload,
-                correlationId: orderId,
-                causationId: wrapper.metadata?.messageId,
-                source: `saga-step-executor:${stepName}`,
-                traceContext: stepTraceCarrier,
-                stepName,
-                idempotencyKey,
-              }),
-              createdAt: new Date().toISOString(),
-            });
-
-            return Result.ok({
-              deduplicated,
-              outcome,
-              output: responsePayload,
-            });
+      async (stepTraceCarrier) => {
+        // 1. Execute Domain UseCase and persist outcome in Transactional Inbox (ACID)
+        const txOutcome = await this.unitOfWork.execute<
+          {
+            deduplicated: boolean;
+            outcome: 'OK' | 'ERR';
+            responsePayload: unknown;
           },
-        ),
+          DomainError
+        >(async ({ inbox }) => {
+          const existingInbox =
+            await inbox.findByIdempotencyKey(idempotencyKey);
+          if (existingInbox) {
+            this.logger.log(
+              `Idempotent hit in Inbox for key '${idempotencyKey}' - skipping duplicate domain execution and replaying callback`,
+            );
+            return Result.ok({
+              deduplicated: true,
+              outcome: existingInbox.outcome,
+              responsePayload: existingInbox.responsePayload,
+            });
+          }
+
+          const stepResult = await this.dispatchDomainUseCase(
+            stepName,
+            wrapper.payload,
+          );
+
+          const tracedIncomingWrapper =
+            createMessageWrapper<SagaStepContextPayload>({
+              payload: wrapper.payload,
+              correlationId: orderId,
+              causationId: wrapper.metadata?.messageId,
+              source: `saga-step-executor:${stepName}`,
+              traceContext: stepTraceCarrier,
+              stepName,
+              idempotencyKey,
+            });
+
+          const outcome: 'OK' | 'ERR' = stepResult.isOk() ? 'OK' : 'ERR';
+          const responsePayload = stepResult.isOk()
+            ? stepResult.value
+            : toDomainErrorSnapshot(stepResult.error);
+
+          await inbox.save({
+            idempotencyKey,
+            orderId,
+            stepName,
+            outcome,
+            responsePayload,
+            wrapper: tracedIncomingWrapper,
+            processedAt: new Date().toISOString(),
+          });
+
+          return Result.ok({
+            deduplicated: false,
+            outcome,
+            responsePayload,
+          });
+        });
+
+        if (txOutcome.isErr()) {
+          return Result.err(txOutcome.error);
+        }
+
+        const { deduplicated, outcome, responsePayload } = txOutcome.value;
+
+        // 2. Notify Orchestrator via OrderWorkflowPort.
+        //    If the callback fails (even on a duplicate delivery), return Result.err so the driving
+        //    worker does NOT ACK the message and will retry the callback on redelivery.
+        if (outcome === 'OK') {
+          const callbackResult = await this.orderWorkflow.completeWorkflowStep({
+            correlationToken,
+            output: responsePayload,
+          });
+          if (callbackResult.isErr()) {
+            return Result.err(callbackResult.error);
+          }
+          return Result.ok({
+            deduplicated,
+            outcome: 'OK',
+            output: responsePayload,
+          });
+        }
+
+        const domainError = responsePayload as DomainError;
+        const failCallbackResult = await this.orderWorkflow.failWorkflowStep({
+          correlationToken,
+          error: domainError,
+        });
+        if (failCallbackResult.isErr()) {
+          return Result.err(failCallbackResult.error);
+        }
+
+        // The business failure was persisted in the Inbox AND reported to the orchestrator,
+        // so message processing itself succeeded (the worker can safely ACK the message).
+        return Result.ok({
+          deduplicated,
+          outcome: 'ERR',
+          output: domainError,
+        });
+      },
     );
   }
 
