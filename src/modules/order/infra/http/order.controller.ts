@@ -12,7 +12,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { SagaPipelineRunnerService } from '../../../../infra/aws/saga-pipeline-runner.service.js';
+import { SagaPipelineRunnerService } from '../../../../infra/temporal/saga-pipeline-runner.service.js';
 import { PostgresDatabaseService } from '../../../../infra/database/postgres-client.provider.js';
 import {
   TELEMETRY_PORT,

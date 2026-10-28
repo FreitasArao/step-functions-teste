@@ -1,7 +1,7 @@
 import { Test, type TestingModule } from '@nestjs/testing';
 import { AppModule } from './app.module.js';
-import { SagaPipelineRunnerService } from './infra/aws/saga-pipeline-runner.service.js';
-import { AwsStepFunctionsTranslator } from './infra/aws/translators/sfn-acl.translator.js';
+import { SagaPipelineRunnerService } from './infra/temporal/saga-pipeline-runner.service.js';
+import { TemporalAclTranslator } from './infra/temporal/translators/temporal-acl.translator.js';
 import { CancelOrderUseCase } from './modules/order/application/cancel-order.use-case.js';
 import { ConfirmOrderUseCase } from './modules/order/application/confirm-order.use-case.js';
 import { CreateOrderUseCase } from './modules/order/application/create-order.use-case.js';
@@ -23,7 +23,7 @@ import {
   type UnitOfWorkPort,
 } from './shared/messaging/unit-of-work.port.js';
 
-describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () => {
+describe('Domain Logic, Use Cases (Result Pattern), Temporal.io Adapter & Database UnitOfWork', () => {
   let moduleRef: TestingModule;
   let createOrderUseCase: CreateOrderUseCase;
   let confirmOrderUseCase: ConfirmOrderUseCase;
@@ -35,7 +35,7 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
   let createShipmentUseCase: CreateShipmentUseCase;
   let executeSagaStepUseCase: ExecuteSagaStepUseCase;
   let getOrderDiagnosticsUseCase: GetOrderDiagnosticsUseCase;
-  let awsTranslator: AwsStepFunctionsTranslator;
+  let temporalTranslator: TemporalAclTranslator;
   let pipelineRunner: SagaPipelineRunnerService;
   let stockRepository: StockRepositoryPort;
   let unitOfWork: UnitOfWorkPort;
@@ -58,7 +58,7 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
     createShipmentUseCase = moduleRef.get(CreateShipmentUseCase);
     executeSagaStepUseCase = moduleRef.get(ExecuteSagaStepUseCase);
     getOrderDiagnosticsUseCase = moduleRef.get(GetOrderDiagnosticsUseCase);
-    awsTranslator = moduleRef.get(AwsStepFunctionsTranslator);
+    temporalTranslator = moduleRef.get(TemporalAclTranslator);
     pipelineRunner = moduleRef.get(SagaPipelineRunnerService);
     stockRepository = moduleRef.get(STOCK_REPOSITORY_PORT);
     unitOfWork = moduleRef.get(UNIT_OF_WORK_PORT);
@@ -205,11 +205,49 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
     expect(dump.tables.outbox_messages).toHaveLength(0);
   });
 
-  describe('Saga Completa com Outbox Agnóstico, AWS ACL Translator, Step Functions, SQS e Inbox', () => {
+  describe('Saga Completa com Outbox Agnóstico, Temporal ACL Translator, Temporal Workflow (Async Activity Completion) e Inbox', () => {
     it('Scenario 1 (Happy Path): executes ReserveStock -> ProcessPayment -> CreateShipment -> ConfirmOrder', async () => {
       const createResult = await createOrderUseCase.execute({
         sku: 'SKU-100',
         quantity: 2,
+        amount: 450,
+        zipCode: '01001-000',
+        parentTraceCarrier: {
+          'x-datadog-trace-id': '1000000000000000001',
+          'x-datadog-parent-id': '2000000000000000001',
+        },
+      });
+      expect(createResult.isOk()).toBe(true);
+      if (!createResult.isOk()) return;
+
+      const orderId = createResult.value.order.id;
+      await pipelineRunner.drainUntilSettled();
+
+      const diagResult = await getOrderDiagnosticsUseCase.execute(orderId);
+      expect(diagResult.isOk()).toBe(true);
+      if (!diagResult.isOk()) return;
+
+      expect(diagResult.value.order.status).toBe('CONFIRMED');
+      expect(diagResult.value.workflowExecution.status).toBe('COMPLETED');
+      expect(
+        diagResult.value.transactionalMessaging.inboxProcessedSteps.map(
+          (s) => s.stepName,
+        ),
+      ).toEqual([
+        'RESERVE_STOCK',
+        'PROCESS_PAYMENT',
+        'CREATE_SHIPMENT',
+        'CONFIRM_ORDER',
+      ]);
+      expect(diagResult.value.distributedTracing.traceIds).toContain(
+        '1000000000000000001',
+      );
+    });
+
+    it('Scenario 2 (Fail at Step 1): ReserveStock [ERR] -> CancelOrder', async () => {
+      const createResult = await createOrderUseCase.execute({
+        sku: 'SKU-100',
+        quantity: 50,
         amount: 450,
         zipCode: '01001-000',
       });
@@ -223,18 +261,102 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
       expect(diagResult.isOk()).toBe(true);
       if (!diagResult.isOk()) return;
 
-      expect(diagResult.value.order.status).toBe('CONFIRMED');
+      expect(diagResult.value.order.status).toBe('CANCELLED');
+      expect(diagResult.value.order.cancellationReason).toContain(
+        'INSUFFICIENT_STOCK',
+      );
+      expect(diagResult.value.workflowExecution.status).toBe('ROLLED_BACK');
     });
 
-    it('Scenario 5 (Transactional Inbox Idempotency + AWS ACL Translation): duplicate SQS message delivery does not reserve stock twice', async () => {
-      const rawSqsBody = JSON.stringify({
+    it('Scenario 3 (1-Level Rollback): ReserveStock [OK] -> ProcessPayment [ERR] -> ReleaseStock -> CancelOrder', async () => {
+      const createResult = await createOrderUseCase.execute({
+        sku: 'SKU-100',
+        quantity: 3,
+        amount: 2500,
+        zipCode: '01001-000',
+      });
+      expect(createResult.isOk()).toBe(true);
+      if (!createResult.isOk()) return;
+
+      const orderId = createResult.value.order.id;
+      await pipelineRunner.drainUntilSettled();
+
+      const diagResult = await getOrderDiagnosticsUseCase.execute(orderId);
+      expect(diagResult.isOk()).toBe(true);
+      if (!diagResult.isOk()) return;
+
+      expect(diagResult.value.order.status).toBe('CANCELLED');
+      expect(diagResult.value.domainState.stockReservation?.status).toBe(
+        'RELEASED',
+      );
+      expect(diagResult.value.domainState.currentSkuStock?.availableQuantity).toBe(
+        10,
+      );
+      expect(
+        diagResult.value.transactionalMessaging.inboxProcessedSteps.map(
+          (s) => s.stepName,
+        ),
+      ).toEqual([
+        'RESERVE_STOCK',
+        'PROCESS_PAYMENT',
+        'RELEASE_STOCK',
+        'CANCEL_ORDER',
+      ]);
+    });
+
+    it('Scenario 4 (2-Level Cascading Rollback): ReserveStock [OK] -> ProcessPayment [OK] -> CreateShipment [ERR] -> RefundPayment -> ReleaseStock -> CancelOrder', async () => {
+      const createResult = await createOrderUseCase.execute({
+        sku: 'SKU-100',
+        quantity: 4,
+        amount: 800,
+        zipCode: '99000-000',
+      });
+      expect(createResult.isOk()).toBe(true);
+      if (!createResult.isOk()) return;
+
+      const orderId = createResult.value.order.id;
+      await pipelineRunner.drainUntilSettled();
+
+      const diagResult = await getOrderDiagnosticsUseCase.execute(orderId);
+      expect(diagResult.isOk()).toBe(true);
+      if (!diagResult.isOk()) return;
+
+      expect(diagResult.value.order.status).toBe('CANCELLED');
+      expect(diagResult.value.domainState.payment?.status).toBe('REFUNDED');
+      expect(diagResult.value.domainState.stockReservation?.status).toBe(
+        'RELEASED',
+      );
+      expect(diagResult.value.domainState.currentSkuStock?.availableQuantity).toBe(
+        10,
+      );
+      expect(
+        diagResult.value.transactionalMessaging.inboxProcessedSteps.map(
+          (s) => s.stepName,
+        ),
+      ).toEqual([
+        'RESERVE_STOCK',
+        'PROCESS_PAYMENT',
+        'CREATE_SHIPMENT',
+        'REFUND_PAYMENT',
+        'RELEASE_STOCK',
+        'CANCEL_ORDER',
+      ]);
+    });
+
+    it('Scenario 5 (Transactional Inbox Idempotency + Temporal ACL Translation): duplicate Temporal Activity delivery does not reserve stock twice', async () => {
+      const rawTemporalEnvelope = JSON.stringify({
         stepName: 'RESERVE_STOCK',
         idempotencyKey: 'ord_idempotent_test:RESERVE_STOCK',
-        taskToken: 'aws_sfn_task_token_dup_1',
+        taskToken: Buffer.from(
+          'temporal_local_token:ord_idempotent_test:RESERVE_STOCK:dup1',
+          'utf8',
+        ).toString('base64'),
+        workflowId: 'order-saga-ord_idempotent_test',
+        runId: 'run_dup_1',
         metadata: createMessageWrapper({
           payload: {},
           correlationId: 'ord_idempotent_test',
-          source: 'aws-step-functions',
+          source: 'temporal-workflow',
           traceContext: {
             'x-datadog-trace-id': '1234567890123456789',
             'x-datadog-parent-id': '9876543210987654321',
@@ -249,7 +371,8 @@ describe('Domain Logic, Use Cases (Result Pattern) & Database UnitOfWork', () =>
         },
       });
 
-      const agnosticCommand = awsTranslator.toWorkflowStepCommand(rawSqsBody);
+      const agnosticCommand =
+        temporalTranslator.toWorkflowStepCommand(rawTemporalEnvelope);
       const firstCall = await executeSagaStepUseCase.execute(agnosticCommand);
       expect(firstCall.isOk()).toBe(true);
 

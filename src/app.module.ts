@@ -2,20 +2,6 @@ import { Module } from '@nestjs/common';
 import { createObserveModule } from '@nestjs/observe';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
-import { AslLocalEngineService } from './infra/aws/asl-local-engine.service.js';
-import {
-  createSfnClient,
-  createSqsClient,
-  SFN_CLIENT,
-  SQS_CLIENT,
-} from './infra/aws/aws-clients.provider.js';
-import { OutboxRelayWorker } from './infra/aws/outbox-relay.worker.js';
-import { SagaPipelineRunnerService } from './infra/aws/saga-pipeline-runner.service.js';
-import { StepFunctionsOrderWorkflowAdapter } from './infra/aws/sfn-order-workflow.adapter.js';
-import { SqsMessagePublisherAdapter } from './infra/aws/sqs-message-publisher.adapter.js';
-import { SqsOrderEventsWorker } from './infra/aws/sqs-order-events.worker.js';
-import { SqsSagaStepWorker } from './infra/aws/sqs-saga-step.worker.js';
-import { AwsStepFunctionsTranslator } from './infra/aws/translators/sfn-acl.translator.js';
 import { PostgresDatabaseService } from './infra/database/postgres-client.provider.js';
 import {
   PostgresInboxRepository,
@@ -26,6 +12,15 @@ import {
   DatadogTelemetryService,
   TELEMETRY_PORT,
 } from './infra/telemetry/tracer.js';
+import { OutboxRelayWorker } from './infra/temporal/outbox-relay.worker.js';
+import { SagaPipelineRunnerService } from './infra/temporal/saga-pipeline-runner.service.js';
+import { TemporalConnectionService } from './infra/temporal/temporal-client.provider.js';
+import { TemporalLocalEngineService } from './infra/temporal/temporal-local-engine.service.js';
+import { TemporalEventPublisherAdapter } from './infra/temporal/temporal-message-publisher.adapter.js';
+import { TemporalOrderEventsWorker } from './infra/temporal/temporal-order-events.worker.js';
+import { TemporalOrderWorkflowAdapter } from './infra/temporal/temporal-order-workflow.adapter.js';
+import { TemporalSagaStepWorker } from './infra/temporal/temporal-saga-step.worker.js';
+import { TemporalAclTranslator } from './infra/temporal/translators/temporal-acl.translator.js';
 import { CancelOrderUseCase } from './modules/order/application/cancel-order.use-case.js';
 import { ConfirmOrderUseCase } from './modules/order/application/confirm-order.use-case.js';
 import { CreateOrderUseCase } from './modules/order/application/create-order.use-case.js';
@@ -68,7 +63,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     ObserveModule.forRoot({
       appKey: 'YOUR_APP_KEY',
       appSecret: 'YOUR_APP_SECRET',
-      serviceId: 'step-function',
+      serviceId: 'temporal-order-saga',
     }),
   ],
   controllers: [AppController, OrderController],
@@ -133,7 +128,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     // Generic Messaging Services (100% Agnostic Outbox Relay)
     OutboxRelayService,
 
-    // Domain & Application Use Cases (100% Agnostic of AWS/StepFunctions/SQS)
+    // Domain & Application Use Cases (100% Agnostic of Orchestrator / Queue)
     CreateOrderUseCase,
     ConfirmOrderUseCase,
     CancelOrderUseCase,
@@ -149,30 +144,23 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     RefundPaymentUseCase,
     CreateShipmentUseCase,
 
-    // AWS Translation Layer (ACL) + Step Functions & SQS Adapters + Workers
-    {
-      provide: SFN_CLIENT,
-      useFactory: createSfnClient,
-    },
-    {
-      provide: SQS_CLIENT,
-      useFactory: createSqsClient,
-    },
-    SqsMessagePublisherAdapter,
+    // Temporal.io Translation Layer (ACL) + Temporal Adapters + Workers
+    TemporalAclTranslator,
+    TemporalLocalEngineService,
+    TemporalConnectionService,
+    TemporalEventPublisherAdapter,
     {
       provide: MESSAGE_PUBLISHER_PORT,
-      useExisting: SqsMessagePublisherAdapter,
+      useExisting: TemporalEventPublisherAdapter,
     },
-    AwsStepFunctionsTranslator,
-    AslLocalEngineService,
-    StepFunctionsOrderWorkflowAdapter,
+    TemporalOrderWorkflowAdapter,
     {
       provide: ORDER_WORKFLOW_PORT,
-      useExisting: StepFunctionsOrderWorkflowAdapter,
+      useExisting: TemporalOrderWorkflowAdapter,
     },
     OutboxRelayWorker,
-    SqsOrderEventsWorker,
-    SqsSagaStepWorker,
+    TemporalOrderEventsWorker,
+    TemporalSagaStepWorker,
     SagaPipelineRunnerService,
   ],
 })

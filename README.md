@@ -1,112 +1,173 @@
-# Order Saga — AWS Step Functions + SQS (`waitForTaskToken`) + Outbox/Inbox + DDD + Result Pattern + `dd-trace`
+# Order Saga — Temporal.io (`AsyncCompletionClient`) vs AWS Step Functions + Outbox/Inbox + DDD + Result Pattern + `dd-trace`
 
-Laboratório prático (**build to learn**) demonstrando como orquestrar uma **Saga com Rollback em Cascata (2 níveis)** no **AWS Step Functions** (via **MiniStack**, **PostgreSQL 16** e **Terraform**) mantendo a lógica de negócio **100% agnóstica da AWS** através de:
+Laboratório prático (**build to learn**) na branch `feat/temporal-io` demonstrando a substituição completa do **AWS Step Functions + SQS + Terraform** pelo **Temporal.io** para responder na prática:
 
-- **DDD & Monolito Modular** (`Order`, `Stock`, `Payment`, `Shipping`) com **Ports & Adapters**
-- **Camada de Tradução / Anti-Corruption Layer AWS (`AwsStepFunctionsTranslator`)** isolando `taskToken`, `executionArn` e formato de erro ASL fora do domínio
-- **Result Pattern (`Result<T, E>`)** em todo o domínio e casos de uso (**zero exceptions** para regras de negócio)
-- **AWS SQS (`sendMessage.waitForTaskToken`)** para execução assíncrona dos steps
-- **Transactional Outbox & Transactional Inbox** no PostgreSQL 16 (garantia de entrega + idempotência contra entregas duplicadas do SQS)
-- **`MessageWrapper<T>` + Datadog `dd-trace`** para propagação de **Trace Distribuído** (`x-datadog-trace-id`, `x-datadog-parent-id`, `traceparent`) através de banco (Outbox/Inbox), Step Functions e SQS
+> **"Quão bom e desacoplável está o `MessageWrapper<T>` e o conjunto de Ports (`OrderWorkflowPort`, `ExecuteSagaStepInboundPort`, `MessagePublisherPort`, `Inbox`, `Outbox`, `UnitOfWork`)?"**
 
 ---
 
-## Como o Fluxo Funciona ao Bater em `POST /orders`?
+## 1. Veredito Arquitetural: Quão Desacoplado Está o `MessageWrapper` e as Ports?
 
-**Sim!** Uma vez com o ambiente de pé (na branch `master`, ou após você completar os `TODO`s na branch `practice/saga`), **basta fazer um `POST /orders`** e todo o ciclo abaixo acontece automaticamente em background:
+Para colocar a arquitetura à prova sem "roubar" no teste, migramos de **AWS Step Functions (`waitForTaskToken` + SQS + ASL JSON)** para **Temporal.io (TypeScript Workflows + Async Activity Completion)** mantendo a regra: **proibido alterar qualquer regra de negócio, caso de uso, contrato de mensageria ou porta**.
+
+### Resultado Real do `git diff main` por Camada
+
+| Camada / Diretório | Arquivos | Linhas Alteradas | Veredito |
+| :--- | :--- | :---: | :--- |
+| **`src/shared/messaging/**`** | [`message-wrapper.ts`](./src/shared/messaging/message-wrapper.ts), [`outbox-relay.service.ts`](./src/shared/messaging/outbox-relay.service.ts), [`inbox.port.ts`](./src/shared/messaging/inbox.port.ts), [`outbox.port.ts`](./src/shared/messaging/outbox.port.ts), [`unit-of-work.port.ts`](./src/shared/messaging/unit-of-work.port.ts) | **0 linhas** | **100% Desacoplado** |
+| **`src/shared/core/**`** | [`result.ts`](./src/shared/core/result.ts), [`domain-error.ts`](./src/shared/core/domain-error.ts) | **0 linhas** | **100% Desacoplado** |
+| **`src/modules/**/domain/**`** | Entidades (`Order`, `StockItem`, `Payment`, `Shipment`), Erros e Repository Ports | **0 linhas** | **100% Desacoplado** |
+| **`src/modules/**/application/**`** | [`create-order.use-case.ts`](./src/modules/order/application/create-order.use-case.ts), [`execute-saga-step.use-case.ts`](./src/modules/order/application/execute-saga-step.use-case.ts), [`get-order-diagnostics.use-case.ts`](./src/modules/order/application/get-order-diagnostics.use-case.ts), [`order-workflow.outbound-port.ts`](./src/modules/order/application/ports/order-workflow.outbound-port.ts), [`saga-step.inbound-port.ts`](./src/modules/order/application/ports/saga-step.inbound-port.ts) | **0 linhas** | **100% Desacoplado** |
+| **`src/modules/order/infra/http/`** | [`order.controller.ts`](./src/modules/order/infra/http/order.controller.ts) | **1 linha** (`import SagaPipelineRunnerService`) | Único ponto de melhoria (ver abaixo) |
+| **`src/infra/temporal/**`** | Novos Adapters, Worker, Workflow TS e [`TemporalAclTranslator`](./src/infra/temporal/translators/temporal-acl.translator.ts) | Substituiu `src/infra/aws/**` | Plug & Play via Injeção de Dependência |
+
+```bash
+# Você mesmo pode auditar com um único comando:
+git diff main -- src/shared/ src/modules/order/application/ src/modules/order/domain/ src/modules/stock/ src/modules/payment/ src/modules/shipping/
+# (Saída vazia = 0 linhas alteradas!)
+```
+
+### Por que o `MessageWrapper<T>` funcionou tão bem na troca para o Temporal.io?
+
+1. **Zero Vazamento de Protocolo (`taskToken` / `executionArn` / `runId` fora do Wrapper):**
+   - O [`MessageWrapper<T>`](./src/shared/messaging/message-wrapper.ts) carrega apenas metadados agnósticos (`messageId`, `correlationId`, `causationId`, `timestamp`, `source`, `traceContext`) e o `payload` de domínio.
+   - Enquanto na AWS o `taskToken` é uma string opaca gerada pelo Step Functions no SQS, no Temporal o `taskToken` é um `Uint8Array` binário dentro de `activityInfo().taskToken`.
+   - Graças ao [`WorkflowStepCommand`](./src/modules/order/application/ports/saga-step.inbound-port.ts) e à ACL ([`TemporalAclTranslator`](./src/infra/temporal/translators/temporal-acl.translator.ts)), o `Uint8Array` do Temporal é codificado em Base64 como `correlationToken` na entrada e decodificado de volta para `Uint8Array` quando o [`ExecuteSagaStepUseCase`](./src/modules/order/application/execute-saga-step.use-case.ts) chama `orderWorkflow.completeWorkflowStep` ou `failWorkflowStep`.
+2. **Propagação de Trace Distribuído (`dd-trace`) Intacta:**
+   - Como o `traceContext` (`x-datadog-trace-id`, `x-datadog-parent-id`, `traceparent`) viaja dentro de `wrapper.metadata.traceContext`, o trace iniciado no `POST /orders` atravessa a tabela `outbox_messages`, entra no Workflow do Temporal, desce para cada Activity (`RESERVE_STOCK`, `PROCESS_PAYMENT`, etc.) e é gravado na `inbox_messages` mantendo exatamente o mesmo `traceId` de ponta a ponta!
+3. **Normalização de Falhas na Compensação (`payload.failure`):**
+   - No Step Functions, o bloco `Catch` injeta `payload.error = { Error, Cause }`.
+   - No Temporal, uma Activity falha lançando `ApplicationFailure.nonRetryable(message, code, details)` capturada como `ActivityFailure` no `try/catch` do Workflow.
+   - O [`TemporalAclTranslator`](./src/infra/temporal/translators/temporal-acl.translator.ts) converte o erro do Temporal para a mesma estrutura agnóstica `payload.failure = { code, message }` que o `CancelOrderUseCase` espera.
+4. **Único Ponto de Acoplamento Encontrado (Lição Aprendida):**
+   - No [`OrderController`](./src/modules/order/infra/http/order.controller.ts), a classe `SagaPipelineRunnerService` estava sendo importada pelo caminho físico de `infra/aws`. Se ela fosse injetada por um token de porta (ex.: `SAGA_PIPELINE_RUNNER_PORT`), nem essa única linha de `import` no controller HTTP precisaria mudar.
+
+---
+
+## 2. Comparativo Técnico: AWS Step Functions (`main`) vs Temporal.io (`feat/temporal-io`)
+
+| Dimensão | AWS Step Functions + SQS (`main`) | Temporal.io (`feat/temporal-io`) |
+| :--- | :--- | :--- |
+| **Definição da Saga** | JSON declarativo (`order-saga.asl.json` com ~180 linhas de estados, `ResultPath` e `Catch` encadeados) | Código TypeScript determinístico ([`order-saga.workflow.ts`](./src/infra/temporal/workflows/order-saga.workflow.ts)) com pilha LIFO `compensations.unshift(...)` e `try/catch` nativo |
+| **Pausa / Callback Assíncrono** | `arn:aws:states:::sqs:sendMessage.waitForTaskToken` + `SendTaskSuccessCommand` / `SendTaskFailureCommand` | `throw new CompleteAsyncError()` na Activity ([`order-saga.activities.ts`](./src/infra/temporal/activities/order-saga.activities.ts)) + `AsyncCompletionClient.complete(taskToken)` / `fail(taskToken)` |
+| **Camada Anticorrupção (ACL)** | `AwsStepFunctionsTranslator` (`sfn-acl.translator.ts`) | [`TemporalAclTranslator`](./src/infra/temporal/translators/temporal-acl.translator.ts) |
+| **Adapter de `OrderWorkflowPort`** | `StepFunctionsOrderWorkflowAdapter` (`@aws-sdk/client-sfn`) | [`TemporalOrderWorkflowAdapter`](./src/infra/temporal/temporal-order-workflow.adapter.ts) (`@temporalio/client`) |
+| **Provisionamento Local** | LocalStack + Terraform (`terraform init && terraform apply`) | Apenas `docker compose up -d` (Zero Terraform — Workflows são registrados pelo Worker em código) |
+| **Observabilidade Visual** | AWS CLI (`stepfunctions get-execution-history`) | **Temporal Web UI** (`http://localhost:8088`) + Temporal CLI |
+
+### Como ficou o Rollback em Cascata no Temporal (`order-saga.workflow.ts`)?
+
+Em vez de 7 estados JSON interligados manualmente por `Catch`, no Temporal usamos o padrão clássico de **Pilha de Compensação LIFO** em TypeScript:
+
+```ts
+const compensations: Array<() => Promise<void>> = [];
+
+try {
+  // Passo 1: Reserva Estoque
+  statePayload.stock = await dispatchSagaStepActivity({ stepName: 'RESERVE_STOCK', ... });
+  // Registra Compensação Nível 1
+  compensations.unshift(async () => {
+    await dispatchSagaStepActivity({ stepName: 'RELEASE_STOCK', ... });
+  });
+
+  // Passo 2: Processa Pagamento
+  statePayload.payment = await dispatchSagaStepActivity({ stepName: 'PROCESS_PAYMENT', ... });
+  // Registra Compensação Nível 2 (no topo da pilha, roda ANTES do ReleaseStock!)
+  compensations.unshift(async () => {
+    await dispatchSagaStepActivity({ stepName: 'REFUND_PAYMENT', ... });
+  });
+
+  // Passo 3 e 4: Logística e Confirmação
+  statePayload.shipment = await dispatchSagaStepActivity({ stepName: 'CREATE_SHIPMENT', ... });
+  statePayload.confirmation = await dispatchSagaStepActivity({ stepName: 'CONFIRM_ORDER', ... });
+} catch (err) {
+  // Executa compensações em cascata na ordem inversa (Nível 2 -> Nível 1)
+  for (const runCompensation of compensations) {
+    await runCompensation();
+  }
+  // Cancela o pedido com o motivo da falha
+  await dispatchSagaStepActivity({ stepName: 'CANCEL_ORDER', ... });
+  throw ApplicationFailure.nonRetryable('Order saga failed...', 'ORDER_SAGA_ROLLED_BACK');
+}
+```
+
+---
+
+## 3. Fluxo Completo ao Bater em `POST /orders` com Temporal.io
 
 ```text
 1. [HTTP POST /orders]
      │
      ▼
-2. [CreateOrderUseCase + PostgresUnitOfWork]
+2. [CreateOrderUseCase + PostgresUnitOfWork] (0 linhas alteradas)
      ├── Salva Order (status = 'PENDING') na tabela `orders`
-     └── Salva evento 'ORDER_WORKFLOW_REQUESTED' (status = 'PENDING') na tabela `outbox_messages`
-     │
-     ▼ (Polling automático a cada 250ms pelo OutboxRelayWorker -> RelayOutboxUseCase)
-3. [StepFunctionsOrderWorkflowAdapter + AwsStepFunctionsTranslator]
-     ├── Traduz MessageWrapper para StartExecutionCommand do AWS Step Functions
-     ├── Inicia a State Machine no MiniStack (usando orderId como nome da execução)
-     └── Marca o registro da Outbox como 'PUBLISHED'
+     └── Salva evento 'ORDER_CREATED' (status = 'PENDING') com MessageWrapper na `outbox_messages`
      │
      ▼
-4. [MiniStack Step Functions -> MiniStack SQS]
-     ├── A State Machine entra no passo 1 ('ReserveStock')
-     ├── Publica mensagem JSON na fila SQS `order-saga-tasks-queue` com `$$.Task.Token`
-     └── Pausa a execução esperando callback (.waitForTaskToken)
+3. [OutboxRelayService -> TemporalEventPublisherAdapter -> TemporalOrderEventsWorker]
+     ├── Publica a mensagem pendente da Outbox e marca como 'PUBLISHED'
+     └── Chama `OrderWorkflowPort.startOrderWorkflow(wrapper)`
      │
-     ▼ (Polling automático a cada 300ms pelo SqsSagaStepWorker)
-5. [AwsStepFunctionsTranslator -> ExecuteSagaStepUseCase]
-     ├── Traduz o JSON da AWS (taskToken) para `WorkflowStepCommand` agnóstico (correlationToken)
+     ▼
+4. [TemporalOrderWorkflowAdapter + TemporalAclTranslator]
+     ├── Traduz MessageWrapper para `WorkflowClient.start(orderSagaWorkflow, { workflowId: 'order-saga-<orderId>' })`
+     └── Inicia o Workflow no Temporal Server (TaskQueue: `order-saga-task-queue`)
+     │
+     ▼
+5. [Temporal Worker -> Activity (`dispatchSagaStepActivity`)]
+     ├── O Workflow entra no passo ('RESERVE_STOCK', 'PROCESS_PAYMENT', etc.)
+     ├── A Activity captura o `activityInfo().taskToken` binário do Temporal (em Base64)
+     ├── Enfileira o `TemporalActivityEnvelope` e lança `CompleteAsyncError` (pausando a Activity no Temporal)
+     │
+     ▼
+6. [TemporalAclTranslator -> ExecuteSagaStepUseCase] (0 linhas alteradas)
+     ├── Traduz o envelope do Temporal para `WorkflowStepCommand` agnóstico (`correlationToken`)
      ├── Abre transação ACID no Postgres (`PostgresUnitOfWork`):
      │     1. Verifica idempotência na tabela `inbox_messages` (`orderId:stepName`)
      │     2. Executa o Use Case de Domínio puro (`Result<T, DomainError>`)
      │     3. Salva na `inbox_messages` (`outcome = 'OK'` ou `'ERR'`)
-     │     4. Salva na `outbox_messages` (`WORKFLOW_STEP_COMPLETED` ou `WORKFLOW_STEP_FAILED`)
-     └── Deleta a mensagem da fila SQS
+     └── Chama `OrderWorkflowPort.completeWorkflowStep` ou `failWorkflowStep`
      │
-     ▼ (Polling automático pelo OutboxRelayWorker)
-6. [Callback para o Step Functions]
-     ├── Se 'WORKFLOW_STEP_COMPLETED' -> envia `SendTaskSuccessCommand` -> avança para o próximo Step!
-     └── Se 'WORKFLOW_STEP_FAILED'    -> envia `SendTaskFailureCommand` -> aciona o `Catch` (Rollback em Cascata)!
+     ▼
+7. [Callback Assíncrono via `AsyncCompletionClient` do Temporal]
+     ├── Se 'OK'  -> `AsyncCompletionClient.complete(taskToken, output)` -> avança para a próxima Activity!
+     └── Se 'ERR' -> `AsyncCompletionClient.fail(taskToken, ApplicationFailure)` -> cai no `catch` do Workflow e roda a pilha `compensations`!
 ```
-
-> **Atenção sobre as Branches:**
-> - **Branch `master`:** Possui toda a implementação pronta e funcionando ponta a ponta.
-> - **Branch `practice/saga`:** Possui o Banco de Dados (Postgres), Entidades de Domínio, Repositórios e Use Cases de Domínio prontos, deixando os **6 arquivos da Saga/AWS com `TODO (Prática)`** para você implementar!
 
 ---
 
-## 1. Passo a Passo: Como Rodar Tudo com MiniStack + PostgreSQL + Terraform
+## 4. Tutorial Passo a Passo: Como Subir e Testar Tudo
 
-### Passo 1.1 — Subir o PostgreSQL 16 e o MiniStack via Docker Compose
+### Passo 4.1 — Rodar os Testes Automatizados (Unitários + Saga Completa)
+Mesmo sem Docker, todos os 5 cenários da Saga (incluindo Rollback de 1 e 2 níveis e Idempotência de Inbox com o `TemporalAclTranslator`) podem ser validados instantaneamente:
+```bash
+bun run test
+```
+
+### Passo 4.2 — Subir PostgreSQL 16 + Temporal Server + Temporal Web UI via Docker Compose
 Na raiz do projeto, execute:
 ```bash
 docker compose up -d
 ```
-Verifique se os 2 containers estão rodando (`step-function-postgres` na porta `5432` e `step-function-ministack` na porta `4566`):
+Verifique se os 3 containers estão rodando:
+- `step-function-postgres` (porta `5432`)
+- `order-saga-temporal` (porta `7233` — gRPC do Temporal Server)
+- `order-saga-temporal-ui` (porta `8088` — interface visual do Temporal no navegador: `http://localhost:8088`)
+
 ```bash
 docker compose ps
 ```
+> **Nota:** Diferente da branch `main` (Step Functions), **não é necessário rodar Terraform**! No Temporal.io a definição do Workflow é código TypeScript ([`order-saga.workflow.ts`](./src/infra/temporal/workflows/order-saga.workflow.ts)) registrado automaticamente pelo Worker da aplicação.
 
-### Passo 1.2 — Criar a Fila SQS e a State Machine no MiniStack via Terraform
-```bash
-cd infra
-terraform init
-terraform apply -auto-approve
-cd ..
-```
-Ao finalizar, o Terraform exibirá os outputs:
-- `sqs_queue_url` (`http://localhost:4566/000000000000/order-saga-tasks-queue`)
-- `state_machine_arn` (`arn:aws:states:us-east-1:000000000000:stateMachine:order-saga-state-machine`)
-
-### Passo 1.3 — Iniciar a Aplicação NestJS
+### Passo 4.3 — Iniciar a Aplicação NestJS
 ```bash
 bun run start:dev
 ```
-A aplicação subirá em `http://localhost:3000`, conectará automaticamente ao PostgreSQL (`order_saga_db`) e iniciará os workers de background (`OutboxRelayWorker` e `SqsSagaStepWorker`).
+A aplicação subirá em `http://localhost:3000`, conectará ao PostgreSQL (`order_saga_db`), conectará ao Temporal Server (`localhost:7233`) e iniciará o Temporal Worker escutando a fila `order-saga-task-queue`.
 
 ---
 
-## 2. Roteiro de Implementação na Branch `practice/saga`
-
-Se você estiver na branch `practice/saga`, implemente os `TODO`s nesta sequência:
-
-1. [`src/modules/order/application/create-order.use-case.ts`](./src/modules/order/application/create-order.use-case.ts): Criar o `MessageWrapper` e salvar o evento `'ORDER_WORKFLOW_REQUESTED'` na Outbox dentro da `unitOfWork`.
-2. [`src/modules/order/application/execute-saga-step.use-case.ts`](./src/modules/order/application/execute-saga-step.use-case.ts): Implementar a coordenação agnóstica `Inbox` ➔ `UseCase de Domínio` ➔ `Outbox ('WORKFLOW_STEP_COMPLETED' | 'WORKFLOW_STEP_FAILED')`.
-3. [`src/modules/order/application/relay-outbox.use-case.ts`](./src/modules/order/application/relay-outbox.use-case.ts): Ler mensagens `PENDING` da Outbox e chamar `this._orderWorkflow` (`startOrderWorkflow`, `completeWorkflowStep`, `failWorkflowStep`).
-4. [`src/infra/aws/translators/sfn-acl.translator.ts`](./src/infra/aws/translators/sfn-acl.translator.ts): Implementar a camada de tradução (ACL) entre os tipos da AWS (`taskToken`, `executionArn`, `payload.error`) e os tipos agnósticos da aplicação (`correlationToken`, `workflowInstanceId`, `payload.failure`).
-5. [`src/infra/aws/sfn-order-workflow.adapter.ts`](./src/infra/aws/sfn-order-workflow.adapter.ts) e [`src/infra/aws/sqs-saga-step.worker.ts`](./src/infra/aws/sqs-saga-step.worker.ts): Conectar os comandos do `@aws-sdk/client-sfn` e `@aws-sdk/client-sqs`.
-6. [`infra/statemachine/order-saga.asl.json`](./infra/statemachine/order-saga.asl.json): Completar os estados da State Machine (`ReserveStock` ➔ `ProcessPayment` ➔ `CreateShipment` ➔ `ConfirmOrder` e os rollbacks `RefundPayment` ➔ `ReleaseStock` ➔ `CancelOrder`) e rodar `cd infra && terraform apply -auto-approve`.
-
-> **Dica:** A qualquer momento você pode comparar sua implementação com o gabarito na `master`:
-> ```bash
-> git diff master -- src/modules/order/application/execute-saga-step.use-case.ts
-> ```
-
----
-
-## 3. Como Testar Cada Etapa e os Rollbacks (`curl`)
+## 5. Como Testar Cada Etapa e os Rollbacks (`curl`)
 
 Antes de começar (ou entre um teste e outro), você pode conferir o estoque inicial ou resetar o banco:
 
@@ -122,7 +183,7 @@ curl -s -X POST http://localhost:3000/db/reset | jq
 
 ### Cenário 1: Caminho Feliz (`ReserveStock` ➔ `ProcessPayment` ➔ `CreateShipment` ➔ `ConfirmOrder`)
 
-**1. Bater no endpoint de criação do pedido:**
+**1. Criar o pedido:**
 ```bash
 curl -s -X POST http://localhost:3000/orders \
   -H "Content-Type: application/json" \
@@ -136,7 +197,7 @@ curl -s -X POST http://localhost:3000/orders \
   }' | jq
 ```
 
-**2. Validar o estado do pedido, Inbox, Outbox e Trace Distribuído (substitua `<ORDER_ID>` pelo `order.id` retornado):**
+**2. Consultar o diagnóstico completo do pedido (substitua `<ORDER_ID>` pelo `order.id` retornado):**
 ```bash
 curl -s http://localhost:3000/orders/<ORDER_ID> | jq
 ```
@@ -147,6 +208,7 @@ curl -s http://localhost:3000/orders/<ORDER_ID> | jq
 - `domainState.payment.status`: `"APPROVED"`
 - `domainState.shipment.status`: `"DISPATCHED"`
 - `workflowExecution.status`: `"COMPLETED"`
+- `workflowExecution.workflowInstanceId`: `"order-saga-<ORDER_ID>:<RUN_ID>"`
 - `transactionalMessaging.inboxProcessedSteps`: 4 steps processados (`RESERVE_STOCK`, `PROCESS_PAYMENT`, `CREATE_SHIPMENT`, `CONFIRM_ORDER`)
 - `distributedTracing.traceIds`: `["1000000000000000001"]`
 
@@ -167,7 +229,7 @@ curl -s -X POST http://localhost:3000/orders \
   }' | jq
 ```
 
-**Validar o resultado (`GET /orders/<ORDER_ID>` e `GET /stock`):**
+**Validar o resultado (`GET /orders/<ORDER_ID>`):**
 - `order.status`: `"CANCELLED"`
 - `order.cancellationReason`: `"INSUFFICIENT_STOCK: Insufficient stock for SKU 'SKU-100'..."`
 - `workflowExecution.status`: `"ROLLED_BACK"`
@@ -235,33 +297,29 @@ curl -s -X POST http://localhost:3000/orders \
 
 ---
 
-## 4. Como Inspecionar o MiniStack (AWS CLI) e o Banco PostgreSQL (`psql`)
+## 6. Como Inspecionar o Temporal (Web UI + CLI) e o PostgreSQL (`psql`)
 
-### 4.1 Inspecionar a State Machine e as Execuções no MiniStack via AWS CLI
+### 6.1 Inspecionar na Temporal Web UI
+Abra no navegador:
+- **`http://localhost:8088`**
+- Você verá todas as execuções `order-saga-<ORDER_ID>`, o `Memo` com o `correlationId` e `traceContext`, e a linha do tempo detalhada de cada `dispatchSagaStepActivity` e suas compensações!
+
+### 6.2 Inspecionar Workflows via Temporal CLI (dentro do container)
 ```bash
-# 1. Listar as State Machines criadas pelo Terraform no MiniStack
-AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
-  stepfunctions list-state-machines | jq
+# 1. Listar todas as execuções de Workflow no Temporal
+docker exec -it order-saga-temporal temporal workflow list --address temporal:7233
 
-# 2. Listar todas as execuções da Order Saga no MiniStack
-AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
-  stepfunctions list-executions \
-  --state-machine-arn arn:aws:states:us-east-1:000000000000:stateMachine:order-saga-state-machine | jq
-
-# 3. Ver o histórico passo a passo de uma execução específica no Step Functions
-AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
-  stepfunctions get-execution-history \
-  --execution-arn arn:aws:states:us-east-1:000000000000:execution:order-saga-state-machine:<ORDER_ID> | jq
+# 2. Ver o histórico de eventos passo a passo de um pedido específico
+docker exec -it order-saga-temporal temporal workflow show \
+  --workflow-id order-saga-<ORDER_ID> \
+  --address temporal:7233
 ```
 
-### 4.2 Inspecionar as Tabelas Reais no PostgreSQL via `psql`
+### 6.3 Inspecionar as Tabelas Reais no PostgreSQL via `psql`
 ```bash
-# 1. Ver eventos da Transactional Outbox (ORDER_WORKFLOW_REQUESTED, WORKFLOW_STEP_COMPLETED, WORKFLOW_STEP_FAILED)
+# 1. Ver eventos da Transactional Outbox (ORDER_CREATED)
 docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
-  "SELECT id, order_id, event_type, status, workflow_instance_id, created_at, published_at FROM outbox_messages ORDER BY created_at;"
+  "SELECT id, order_id, event_type, status, created_at, published_at FROM outbox_messages ORDER BY created_at;"
 
 # 2. Ver chaves de idempotência na Transactional Inbox (PRIMARY KEY order_id:step_name)
 docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
@@ -276,7 +334,7 @@ docker exec -it step-function-postgres psql -U saga_user -d order_saga_db -c \
   "SELECT id, sku, quantity, amount, zip_code, status, cancellation_reason FROM orders; SELECT id, order_id, amount, status, refunded_at FROM payments; SELECT id, order_id, zip_code, status, tracking_code FROM shipments;"
 ```
 
-### 4.3 Inspecionar via Endpoint HTTP (`GET /db`)
+### 6.4 Inspecionar via Endpoint HTTP (`GET /db`)
 ```bash
 curl -s http://localhost:3000/db | jq
 ```

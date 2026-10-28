@@ -9,16 +9,17 @@ import type {
   MessageWrapper,
   SagaStepName,
 } from '../../shared/messaging/message-wrapper.js';
-import type { AwsSfnSqsTaskEnvelope } from './translators/sfn-acl.translator.js';
+import type { TemporalActivityEnvelope } from './translators/temporal-acl.translator.js';
 
-interface ActiveExecution {
-  readonly executionArn: string;
+interface ActiveTemporalExecution {
+  readonly workflowId: string;
+  readonly runId: string;
   readonly orderId: string;
   currentStep: SagaStepName;
   status: WorkflowExecutionSummary['status'];
   stateJson: {
     metadata: MessageWrapper<StartSagaPayload>['metadata'];
-    payload: AwsSfnSqsTaskEnvelope['payload'];
+    payload: TemporalActivityEnvelope['payload'];
   };
   readonly startedAt: string;
   finishedAt?: string;
@@ -27,23 +28,35 @@ interface ActiveExecution {
 }
 
 /**
- * Local in-process interpreter for infra/statemachine/order-saga.asl.json
- * Used as fallback when LocalStack/MiniStack is offline during unit tests.
+ * Buffers incoming Temporal Activity envelopes (both from live Temporal Worker activities
+ * and from the in-process Temporal Workflow emulator used during unit tests when Temporal Server is offline).
  */
 @Injectable()
-export class AslLocalEngineService {
-  private readonly executionsByOrder = new Map<string, ActiveExecution>();
-  private readonly executionsByToken = new Map<string, ActiveExecution>();
-  private readonly rawSqsQueueBuffer: string[] = [];
+export class TemporalLocalEngineService {
+  private readonly executionsByOrder = new Map<
+    string,
+    ActiveTemporalExecution
+  >();
+  private readonly executionsByToken = new Map<
+    string,
+    ActiveTemporalExecution
+  >();
+  private readonly activityEnvelopeBuffer: string[] = [];
 
-  startExecution(wrapper: MessageWrapper<StartSagaPayload>): {
+  enqueueLiveActivityEnvelope(envelope: TemporalActivityEnvelope): void {
+    this.activityEnvelopeBuffer.push(JSON.stringify(envelope));
+  }
+
+  startLocalWorkflowExecution(wrapper: MessageWrapper<StartSagaPayload>): {
     workflowInstanceId: string;
   } {
     const orderId = wrapper.payload.orderId;
-    const executionArn = `arn:aws:states:us-east-1:000000000000:execution:order-saga-state-machine:${orderId}`;
+    const workflowId = `order-saga-${orderId}`;
+    const runId = randomUUID();
 
-    const execution: ActiveExecution = {
-      executionArn,
+    const execution: ActiveTemporalExecution = {
+      workflowId,
+      runId,
       orderId,
       currentStep: 'RESERVE_STOCK',
       status: 'RUNNING',
@@ -55,39 +68,54 @@ export class AslLocalEngineService {
     };
 
     this.executionsByOrder.set(orderId, execution);
-    this.enqueueStep(execution, 'RESERVE_STOCK');
-    return { workflowInstanceId: executionArn };
+    this.enqueueLocalStep(execution, 'RESERVE_STOCK');
+    return { workflowInstanceId: `${workflowId}:${runId}` };
   }
 
-  private enqueueStep(
-    execution: ActiveExecution,
+  private enqueueLocalStep(
+    execution: ActiveTemporalExecution,
     stepName: SagaStepName,
   ): void {
     execution.currentStep = stepName;
-    const taskToken = `task_token_${execution.orderId}_${stepName}_${randomUUID().slice(0, 6)}`;
-    this.executionsByToken.set(taskToken, execution);
+    const rawToken = `temporal_local_token:${execution.orderId}:${stepName}:${randomUUID().slice(0, 8)}`;
+    const taskTokenBase64 = Buffer.from(rawToken, 'utf8').toString('base64');
+    this.executionsByToken.set(taskTokenBase64, execution);
 
-    const rawEnvelope: AwsSfnSqsTaskEnvelope = {
+    const rawEnvelope: TemporalActivityEnvelope = {
       stepName,
       idempotencyKey: `${execution.orderId}:${stepName}`,
-      taskToken,
+      taskToken: taskTokenBase64,
+      workflowId: execution.workflowId,
+      runId: execution.runId,
       metadata: { ...execution.stateJson.metadata },
       payload: structuredClone(execution.stateJson.payload),
     };
 
-    this.rawSqsQueueBuffer.push(JSON.stringify(rawEnvelope));
+    this.activityEnvelopeBuffer.push(JSON.stringify(rawEnvelope));
   }
 
-  dequeueRawSqsBodies(max = 5): string[] {
-    return this.rawSqsQueueBuffer.splice(0, max);
+  isLocalTaskToken(correlationToken: string): boolean {
+    if (this.executionsByToken.has(correlationToken)) {
+      return true;
+    }
+    try {
+      const decoded = Buffer.from(correlationToken, 'base64').toString('utf8');
+      return decoded.startsWith('temporal_local_token:');
+    } catch {
+      return false;
+    }
   }
 
-  handleSendTaskSuccess(taskToken: string, output: unknown): void {
-    const execution = this.executionsByToken.get(taskToken);
+  dequeueRawActivityEnvelopes(max = 5): string[] {
+    return this.activityEnvelopeBuffer.splice(0, max);
+  }
+
+  handleAsyncActivityComplete(correlationToken: string, output: unknown): void {
+    const execution = this.executionsByToken.get(correlationToken);
     if (!execution || execution.status !== 'RUNNING') {
       return;
     }
-    this.executionsByToken.delete(taskToken);
+    this.executionsByToken.delete(correlationToken);
 
     const step = execution.currentStep;
     const payload = execution.stateJson.payload as Record<string, unknown>;
@@ -95,17 +123,17 @@ export class AslLocalEngineService {
     switch (step) {
       case 'RESERVE_STOCK':
         payload.stock = output;
-        this.enqueueStep(execution, 'PROCESS_PAYMENT');
+        this.enqueueLocalStep(execution, 'PROCESS_PAYMENT');
         break;
 
       case 'PROCESS_PAYMENT':
         payload.payment = output;
-        this.enqueueStep(execution, 'CREATE_SHIPMENT');
+        this.enqueueLocalStep(execution, 'CREATE_SHIPMENT');
         break;
 
       case 'CREATE_SHIPMENT':
         payload.shipment = output;
-        this.enqueueStep(execution, 'CONFIRM_ORDER');
+        this.enqueueLocalStep(execution, 'CONFIRM_ORDER');
         break;
 
       case 'CONFIRM_ORDER':
@@ -116,12 +144,12 @@ export class AslLocalEngineService {
 
       case 'REFUND_PAYMENT':
         payload.paymentRefund = output;
-        this.enqueueStep(execution, 'RELEASE_STOCK');
+        this.enqueueLocalStep(execution, 'RELEASE_STOCK');
         break;
 
       case 'RELEASE_STOCK':
         payload.stockRelease = output;
-        this.enqueueStep(execution, 'CANCEL_ORDER');
+        this.enqueueLocalStep(execution, 'CANCEL_ORDER');
         break;
 
       case 'CANCEL_ORDER':
@@ -135,16 +163,19 @@ export class AslLocalEngineService {
     }
   }
 
-  handleSendTaskFailure(taskToken: string, error: DomainError): void {
-    const execution = this.executionsByToken.get(taskToken);
+  handleAsyncActivityFailure(
+    correlationToken: string,
+    error: DomainError,
+  ): void {
+    const execution = this.executionsByToken.get(correlationToken);
     if (!execution || execution.status !== 'RUNNING') {
       return;
     }
-    this.executionsByToken.delete(taskToken);
+    this.executionsByToken.delete(correlationToken);
 
     const step = execution.currentStep;
     const payload = execution.stateJson.payload as Record<string, unknown>;
-    const causeStr = JSON.stringify({
+    const detailsStr = JSON.stringify({
       code: error.code,
       message: error.message,
       retryable: error.retryable ?? false,
@@ -152,27 +183,28 @@ export class AslLocalEngineService {
     });
 
     payload.error = {
-      Error: error.code,
-      Cause: causeStr,
+      type: error.code,
+      message: error.message,
+      details: detailsStr,
     };
 
     switch (step) {
       case 'RESERVE_STOCK':
-        this.enqueueStep(execution, 'CANCEL_ORDER');
+        this.enqueueLocalStep(execution, 'CANCEL_ORDER');
         break;
 
       case 'PROCESS_PAYMENT':
-        this.enqueueStep(execution, 'RELEASE_STOCK');
+        this.enqueueLocalStep(execution, 'RELEASE_STOCK');
         break;
 
       case 'CREATE_SHIPMENT':
-        this.enqueueStep(execution, 'REFUND_PAYMENT');
+        this.enqueueLocalStep(execution, 'REFUND_PAYMENT');
         break;
 
       default:
         execution.status = 'FAILED';
         execution.failureCode = error.code;
-        execution.failureReason = causeStr;
+        execution.failureReason = detailsStr;
         execution.finishedAt = new Date().toISOString();
         break;
     }
@@ -184,7 +216,7 @@ export class AslLocalEngineService {
       return null;
     }
     return {
-      workflowInstanceId: exec.executionArn,
+      workflowInstanceId: `${exec.workflowId}:${exec.runId}`,
       status: exec.status,
       startedAt: exec.startedAt,
       ...(exec.finishedAt ? { finishedAt: exec.finishedAt } : {}),
@@ -196,6 +228,6 @@ export class AslLocalEngineService {
   clear(): void {
     this.executionsByOrder.clear();
     this.executionsByToken.clear();
-    this.rawSqsQueueBuffer.length = 0;
+    this.activityEnvelopeBuffer.length = 0;
   }
 }
